@@ -102,6 +102,9 @@ CE 仍通过 Replica/Worker 句柄同步权重；GS 不维护 node/GPU/lease 资
 ## 4. GS 生命周期与退出边界
 
 TaskRunner、Rollouter、Manager、LB 依次持有同一个 GS 句柄；Trainer/CE 不持有 GS 句柄。
+
+> **设计调整（尚未修改代码）：** 上句描述当前实现，但目标边界已明确为 GS 只与各任务的 TaskRunner 通信、双方互持句柄。后续应移除 Rollouter、Manager、LB 的 GS 参数与字段；推理侧调用经 TaskRunner → Rollouter 转发，CE 操作经 TaskRunner → Trainer 转发，结果沿原链路返回 TaskRunner 后回复 GS。本文仍按当前源码记录，扩展设计见 [verl_expansion.md 第 2.3 节](verl_expansion.md#23-gs-句柄边界)。
+
 发现函数使用固定 namespace `verl-multi-task` 和 name `verl-multi-task-group-scheduler`，
 通过 `get_if_exists=True` 获取同名 detached Actor，并核对实现标识。
 证据：`scheduler/discovery.py:3`、`:21`、`:27`。

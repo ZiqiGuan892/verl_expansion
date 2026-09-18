@@ -1,0 +1,11 @@
+{
+  "ray_address": "auto",
+  "ray_namespace": "verl-multi-task-d0",
+  "verl_source_root": "/absolute/path/to/verl",
+  "native_config": "/absolute/path/to/native-fully-async.yaml",
+  "model_path": "/absolute/path/to/model",
+  "output_dir": "/absolute/path/to/replica-capability-results",
+  "nodes": 1,
+  "gpus_per_node": 2,
+  "timeout_s": 300
+}

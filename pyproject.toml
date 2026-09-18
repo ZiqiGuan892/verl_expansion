@@ -20,4 +20,5 @@ addopts = "-ra --strict-markers"
 markers = [
   "native: imports the actual verl and backend dependencies",
   "ray_integration: starts real CPU Ray actors (no verl or GPU training)",
+  "gpu_integration: requires a configured Linux Ray/GPU/verl/vLLM environment",
 ]
