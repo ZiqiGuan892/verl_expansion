@@ -6,11 +6,11 @@
 2. [`Agent.md`](Agent.md)；
 3. [`docs/develop_step.md`](docs/develop_step.md)。
 
-当前只允许 D0。D0 的状态是“开发完成，真实环境待验收”，所以不要实现 D01 或任何后续业务代码。特别禁止提前修改：
+当前 D0 已由用户确认验收通过，正在执行 D1。D1 只允许实现创建契约、claim 归一化、任务内 rank、幂等记录和生命周期预留接口；D2 及后续业务代码仍禁止提前实现。特别禁止提前修改：
 
-- `MultiTaskvLLMReplica` 的 placement/lease/borrowed 创建；
+- `MultiTaskvLLMReplica` 的实际 placement/lease/borrowed runtime 创建；
 - PG 解析、SubRayResourcePool、CE Worker 创建；
-- sleep/wake、shutdown、destroy/reclaim；
+- sleep/wake、shutdown 以及 destroy/reclaim 的实际清理；
 - CE Manager 成员管理和同步 gate；
 - LB 摘流、READY 和 AgentLoop 请求处理；
 - TaskRunner 生命周期命令。
@@ -22,7 +22,7 @@
 LLMServerManager 的创建点选择扩展 CE Manager、Replica、HTTP Server、LB 和 CE Worker。
 profile 关闭时不导入插件；启用时导入/校验失败必须报错，不能静默退回原生类。
 
-D0 只包含 GPU 验收基础设施：`gpu_integration` marker、`tests/gpu/`、GPU 配置模板和开发日志。当前本机缺少 Python 虚拟环境、GPU、Ray 和真实 verl/vLLM 运行环境，不能声称 D0 已通过。
+D0 包含 GPU 验收基础设施，已由用户确认通过。D1 的实现记录、测试设计和本机环境限制见 [`docs/D1_develop.md`](docs/D1_develop.md)；当前本机仍缺少可用 Python，因此不能把未执行的 D1 测试声称为通过。
 
 修改任何文件前运行 `git status --short`，不要覆盖用户未提交内容。只使用 `apply_patch` 做最小修改，不修改外层 verl 原生代码。每个步骤完成后，必须把修改文件、目的、测试命令、真实环境结果、未验证范围和下一步门禁写入 `docs/develop_step.md`，并等待用户确认后才能继续。
 

@@ -4,18 +4,18 @@
 
 ## 当前任务边界
 
-当前用户授权的是“按 D 步骤逐步开发 replica 能力”，但目前只允许执行 **D0**。用户明确要求：前面的步骤没有由用户说明并通过之前，严禁开发后面的代码。
+当前用户授权的是“按 D 步骤逐步开发 replica 能力”。D0 已由用户确认验收通过；当前正在执行 **D1**，D2 及后续步骤仍然禁止提前开发。
 
 因此当前硬门禁是：
 
-1. D0 真实环境尚未通过。
-2. 不得开始 D01。
-3. 不得修改 replica、lease、PG 解析、sleep/wake、shutdown、borrowed runtime、CE 成员、LB 路由或 TaskRunner 生命周期代码。
-4. 只有用户明确确认 D0 通过后，才可以进入 D01；进入下一步前仍需按 `develop_step.md` 的步骤、验证和日志要求执行。
+1. D0 已完成真实环境验收并由用户确认通过。
+2. D1 只实现创建契约、输入归一化、任务内 rank 分配、幂等记录和生命周期预留接口。
+3. 不得开始 D2 的 PG 解析、Worker/server/engine 创建、borrowed runtime 或真实 GPU 资源操作。
+4. D1 完成后仍需用户明确确认，才能进入 D2；每一步继续按 `develop_step.md` 的验证和日志要求执行。
 
 ## 当前状态
 
-D0 的开发工作已经完成，但只有静态检查通过，真实验收仍未完成。
+D0 的开发工作和真实环境验收已经完成，用户已确认通过；D1 的本地代码开发已完成，测试命令和环境限制记录在 `docs/D1_develop.md`。
 
 D0 修改了：
 
@@ -24,8 +24,11 @@ D0 修改了：
 - `tests/gpu/test_baseline_environment.py`：检查 D0 基线配置和结果记录可序列化。
 - `examples/experimental_fully_async/gpu_test_config.example.json`：真实 GPU 验收配置模板。
 - `docs/develop_step.md`：开发步骤和 D0 开发日志。
+- `src/multi_task_scheduler/integration/verl/experimental_fully_async/llm_server_manager.py`：D1 创建契约、rank 分配、幂等记录和预留回执。
+- `src/multi_task_scheduler/rollout/replica.py`：D1 replica 元数据和生命周期预留接口。
+- `tests/unit/test_borrowed_contract.py`：D1 隔离单元测试。
 
-D0 没有修改任何运行时业务类，也没有实现任何借卡功能。
+D1 没有创建 Ray Actor、PlacementGroup、CE Worker、HTTP server 或 vLLM engine；D2 的实际借卡 runtime 仍未实现。
 
 当前本机验证结果：
 
@@ -34,7 +37,7 @@ D0 没有修改任何运行时业务类，也没有实现任何借卡功能。
 - `uv run ... python --version` 未执行成功：没有可用的 uv managed Python，默认目录还有权限错误。
 - 没有真实 GPU、Ray、verl/vLLM 环境，因此 native standalone 初始化、生成和参数同步尚未验证。
 
-结论必须写作：**D0 开发完成，真实环境待验收，D01 禁止开始。**
+结论必须写作：**D0 已由用户确认通过；D1 代码开发完成，等待 D1 验证和用户确认；D2 禁止开始。**
 
 ## 必读文档及用途
 
@@ -180,7 +183,7 @@ export MT_GPU_TEST_CONFIG=/absolute/path/to/d0-gpu-test-config.json
 
 还必须用同一份 native 配置分别验证关闭 profile 和启用 `experimental_fully_async_standalone`：完成初始化、至少一次生成和一次后续参数同步，并记录 Ray/verl/vLLM/PyTorch/CUDA 版本、实际源码路径、GPU、Actor、engine PID 和显存状态。
 
-在这些证据交给用户并得到明确确认前，任何 Agent 都只能修复 D0 本身的问题，不能进入 D01。
+在 D1 测试证据交给用户并得到明确确认前，任何 Agent 都只能修复 D1 本身的问题，不能进入 D2。D0 的真实验收已由用户确认通过。
 
 ## 当前工作区和外部传输
 

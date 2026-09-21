@@ -243,7 +243,7 @@ RolloutReplica.init_standalone()
 
 具体关系如下：
 
-1. `init_standalone()` 为一个 replica 创建 ResourcePool/Placement Group。ResourcePool 的每个 bundle 表示一个 GPU 位置；`RayWorkerGroup._create_worker()` 使用 `PlacementGroupSchedulingStrategy` 将一个 `CheckpointEngineWorker` 放到对应 bundle，并通过 `runtime_env` 设置 `WORLD_SIZE`、`RANK`、`RAY_LOCAL_WORLD_SIZE`、`MASTER_ADDR` 等环境变量。native standalone 默认还使用 `max_colocate_count=2`，因此 CE Worker 的 Ray GPU 配额可能是一个 bundle 的部分配额，而不是独占整卡。
+1. `init_standalone()` 为一个 replica 创建 ResourcePool/Placement Group。ResourcePool 的每个 bundle 表示一个 GPU 位置；`RayWorkerGroup._create_worker()` 使用 `PlacementGroupSchedulingStrategy` 将一个 `CheckpointEngineWorker` 放到对应 bundle，并通过 `runtime_env` 设置 `WORLD_SIZE`、`RANK`、`RAY_LOCAL_WORLD_SIZE`、`MASTER_ADDR` 等环境变量。原生代码默认 `max_colocate_count=2`，本扩展允许在 PG 创建时配置为 `M=4` 或其他明确值，使同一 bundle 可以容纳多个 fractional CE Worker；该值不支持对已有 PG 动态扩容，也不提供显存隔离。
    `RayWorkerGroup` 会按 node 排序 Placement Group，先按 node 再按 `local_rank` 连续分配 global rank；因此跨机 replica 的 rank 顺序依赖 ResourcePool 的 node 分组和 bundle 顺序，不是由 server 地址决定。
 2. `CheckpointEngineWorker` 在自己的 Ray 进程中创建 checkpoint backend、bucket/transport 状态和 `ServerAdapter`。它会初始化 CPU Gloo 控制组，并在参数同步时执行 `prepare → init_process_group → update_weights → finalize`。它不是无状态的“GPU 标签”，而是带有 CUDA/通信/ServerAdapter 状态的长期 Actor。
 3. `vLLMReplica.launch_servers()` 从每个 CE Worker 查询 `node_id` 和 Ray 分配的可见 GPU，然后按 node 分组创建 `vLLMHttpServer`。每个 node 一个 server Actor；server Actor 接收该节点的 CE Worker handles 和 `CUDA_VISIBLE_DEVICES` 列表。它本身不等于 CE Worker，也不代表每张 GPU 单独注册一个 HTTP server。
