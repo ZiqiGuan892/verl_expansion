@@ -12,6 +12,26 @@ D0 已由用户完成真实环境验收并确认通过。本阶段依据 [verl �
 
 本阶段**不**解析 Ray PlacementGroup，不查询 Ray bundle，不创建 CE Worker、HTTP server、vLLM engine，不建立通信域，也不改变 GS 的全局租约表。真实 borrowed runtime 属于 D2。
 
+### D1 运行时回归修复：GS 注册 RPC 超时
+
+真实 Ascend 启动日志曾在 `MultiTaskFullyAsyncTaskRunner.run()` 的
+`GroupScheduler.attach_task` 处报 `ray.exceptions.GetTimeoutError`。profile 解析、根 Actor
+创建和 GS 发现已进入执行；失败边界是 TaskRunner 等待 GS 注册 RPC 返回。原实现固定等待
+30 秒；日志显示 GS 进程此时仍在执行 Ascend/MindSpeed 初始化，启动等待预算可能不足。
+
+修复位于 `integration/verl/experimental_fully_async/task_runner.py`：
+
+仅将 `ray.get(self.group_scheduler.attach_task.remote(...), timeout=30)` 改为
+`timeout=120`。退出时 `detach_task` 的 30 秒等待和原有异常处理保持不变。
+
+按 MVP 原则撤回此前添加的超时轮询、环境变量配置、Actor ID 转换、ActorHandle 兼容处理
+和额外日志；`scheduler/group_scheduler.py` 恢复原有严格类型检查，无最终代码改动。
+
+两次故障（CACHE_SIZE 导入路径、GS 注册超时）的 traceback、证据、修复差异和服务器验证命令
+统一记录在 [issue.md](../issue.md)。本地检查不代表真实 Ascend 训练已通过；服务器需重新运行
+`multi_task_run.sh`，确认通过 GS 注册并进入 Trainer/Rollouter 初始化。若 120 秒后仍超时，
+需检查 GS 日志、Actor 状态和资源，而不能仅凭超时认定 ActorHandle 不兼容。
+
 ## 2. 修改文件总览
 
 | 文件 | 修改 | 原因 |

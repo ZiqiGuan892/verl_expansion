@@ -14,7 +14,7 @@ import time
 import ray
 
 from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncLLMServerManager
-from verl.workers.rollout.llm_server import DEFAULT_ROUTING_CACHE_SIZE
+from verl.workers.rollout.router import DEFAULT_ROUTING_CACHE_SIZE
 
 from multi_task_scheduler.rollout.load_balancer import MultiTaskGlobalRequestLoadBalancer
 from multi_task_scheduler.rollout.replica import MultiTaskvLLMReplica

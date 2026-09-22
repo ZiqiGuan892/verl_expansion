@@ -1,6 +1,6 @@
 """Native routing subclass with a GS reference and no scheduling side effects."""
 
-from verl.workers.rollout.llm_server import DEFAULT_ROUTING_CACHE_SIZE, GlobalRequestLoadBalancer
+from verl.workers.rollout.router import DEFAULT_ROUTING_CACHE_SIZE, GlobalRequestLoadBalancer
 
 
 class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):

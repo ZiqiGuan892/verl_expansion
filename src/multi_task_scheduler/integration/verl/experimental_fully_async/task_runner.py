@@ -45,7 +45,7 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
         context = ray.get_runtime_context()
         task_id = context.get_actor_id()
         try:
-            ray.get(self.group_scheduler.attach_task.remote(task_id, context.current_actor), timeout=30)
+            ray.get(self.group_scheduler.attach_task.remote(task_id, context.current_actor), timeout=120)
             return super().run(config)
         finally:
             try:
