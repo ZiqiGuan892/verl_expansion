@@ -1,94 +1,103 @@
 #!/usr/bin/env bash
 #
-# D1 contract test entry point.
+# D1 创建契约测试入口，路径和 Ascend 环境参照已在服务器跑通的 multi_task_run.sh。
 #
-# The script is intended to live next to async_run.sh and multi_task_run.sh:
+# 两个脚本放在相同目录，服务器布局为：
 #   VERL_REPO_DIR/
+#   ├── multi_task_run.sh
 #   ├── D1_test.sh
 #   └── verl/
-#       ├── verl/
-#       └── verl_multi_task/ (or multi_task_verl/)
+#       ├── verl/                  # 原生 Python 包
+#       └── multi_task_verl/        # 插件仓库，包含 src/ 和 tests/
 #
-# It runs D1's metadata-only tests.  D1 must not start Ray actors, create a
-# PlacementGroup, start a CE Worker, or launch a vLLM engine.
-# It uses only old-Bash-compatible syntax and does not require pipefail.
+# D1 只验证契约、rank、幂等和预留回执，不启动训练或创建 borrowed runtime。
+# 延续旧 Bash 兼容要求，不依赖 pipefail；末尾显式检查 pytest 和 tee 的退出码。
+set -eu
+set -x
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+export VERL_REPO_DIR="${VERL_REPO_DIR:-${SCRIPT_DIR}}"
+export VERL_MULTI_TASK_ROOT="${VERL_MULTI_TASK_ROOT:-${VERL_REPO_DIR}/verl/multi_task_verl}"
+export PYTHONPATH="${VERL_MULTI_TASK_ROOT}/src:${VERL_REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+export VERL_SOURCE_ROOT="${VERL_SOURCE_ROOT:-${VERL_REPO_DIR}/verl}"
+# 与 multi_task_run.sh 一致，先进入包含原生 verl/ Python 包的仓根。
+cd "${VERL_SOURCE_ROOT}"
+
+export PYTHONPATH="${VERL_MULTI_TASK_ROOT}/src:${VERL_SOURCE_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+export HF_DATASETS_CACHE="${VERL_REPO_DIR}/cache"
+
+# ------------------------------ Ascend 环境 ------------------------------
+
+ASCEND_TOOLKIT_ENV="${ASCEND_TOOLKIT_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}"
+ASCEND_ATB_ENV="${ASCEND_ATB_ENV:-/usr/local/Ascend/nnal/atb/set_env.sh}"
+
+[ -f "${ASCEND_TOOLKIT_ENV}" ] || { echo "未找到 ${ASCEND_TOOLKIT_ENV}" >&2; exit 1; }
+[ -f "${ASCEND_ATB_ENV}" ] || { echo "未找到 ${ASCEND_ATB_ENV}" >&2; exit 1; }
+
+# 与已跑通的入口一致，加载 Ascend 环境时临时关闭 errexit 和 nounset。
+set +e +u
+source "${ASCEND_TOOLKIT_ENV}"
+source "${ASCEND_ATB_ENV}"
 set -eu
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES="${RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES:-1}"
+export HCCL_CONNECT_TIMEOUT="${HCCL_CONNECT_TIMEOUT:-1500}"
+export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
+export HCCL_HOST_SOCKET_PORT_RANGE="${HCCL_HOST_SOCKET_PORT_RANGE:-60000-60050}"
+export HCCL_NPU_SOCKET_PORT_RANGE="${HCCL_NPU_SOCKET_PORT_RANGE:-61000-61050}"
+export VLLM_USE_V1="${VLLM_USE_V1:-1}"
+export VLLM_ASCEND_ENABLE_NZ="${VLLM_ASCEND_ENABLE_NZ:-0}"
+export VLLM_ALLREDUCE_USE_SYMM_MEM="${VLLM_ALLREDUCE_USE_SYMM_MEM:-0}"
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
 
-# Prefer explicit paths. When the script is kept inside this plugin checkout,
-# discover the sibling native checkout used by the local development tree:
-#   workspace/verl-multi-task/D1_test.sh
-#   workspace/verl/verl/experimental/fully_async_policy/fully_async_main.py
-if [ -z "${VERL_REPO_DIR:-}" ] && [ -z "${VERL_SOURCE_ROOT:-}" ] && [ -z "${VERL_MULTI_TASK_ROOT:-}" ]; then
-    if [ -f "${SCRIPT_DIR}/../verl/verl/experimental/fully_async_policy/fully_async_main.py" ]; then
-        VERL_REPO_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
-        VERL_SOURCE_ROOT="${VERL_REPO_DIR}/verl"
-        VERL_MULTI_TASK_ROOT="${SCRIPT_DIR}"
-    elif [ -f "${SCRIPT_DIR}/../verl/experimental/fully_async_policy/fully_async_main.py" ]; then
-        VERL_REPO_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
-        VERL_SOURCE_ROOT="${VERL_REPO_DIR}"
-        VERL_MULTI_TASK_ROOT="${SCRIPT_DIR}"
-    else
-        VERL_REPO_DIR="${SCRIPT_DIR}"
-    fi
-fi
+# ------------------------------ D1 必要测试配置 ------------------------------
 
-VERL_REPO_DIR="$(cd -- "${VERL_REPO_DIR:-${SCRIPT_DIR}}" && pwd)"
-VERL_SOURCE_ROOT="$(cd -- "${VERL_SOURCE_ROOT:-${VERL_REPO_DIR}/verl}" && pwd)"
-
-# Accept both names used by existing server deployments.
-if [ -n "${VERL_MULTI_TASK_ROOT:-}" ]; then
-    VERL_MULTI_TASK_ROOT="${VERL_MULTI_TASK_ROOT}"
-elif [ -d "${VERL_SOURCE_ROOT}/verl_multi_task" ]; then
-    VERL_MULTI_TASK_ROOT="${VERL_SOURCE_ROOT}/verl_multi_task"
-elif [ -d "${VERL_SOURCE_ROOT}/multi_task_verl" ]; then
-    VERL_MULTI_TASK_ROOT="${VERL_SOURCE_ROOT}/multi_task_verl"
-else
-    echo "未找到插件目录：${VERL_SOURCE_ROOT}/verl_multi_task 或 ${VERL_SOURCE_ROOT}/multi_task_verl" >&2
-    exit 1
-fi
-
-# Convert a user-supplied relative plugin path before changing directories.
-case "${VERL_MULTI_TASK_ROOT}" in
-    /*) ;;
-    *) VERL_MULTI_TASK_ROOT="${PWD}/${VERL_MULTI_TASK_ROOT}" ;;
-esac
-
-[ -f "${VERL_SOURCE_ROOT}/verl/experimental/fully_async_policy/fully_async_main.py" ] || {
-    echo "VERL_SOURCE_ROOT 不是有效的 verl 源码根目录：${VERL_SOURCE_ROOT}" >&2
-    exit 1
-}
-[ -d "${VERL_MULTI_TASK_ROOT}/src/multi_task_scheduler" ] || {
-    echo "插件源码目录不存在：${VERL_MULTI_TASK_ROOT}/src/multi_task_scheduler" >&2
-    exit 1
-}
-
-export VERL_REPO_DIR VERL_SOURCE_ROOT VERL_MULTI_TASK_ROOT
-export PYTHONPATH="${VERL_MULTI_TASK_ROOT}/src:${VERL_SOURCE_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+# 使用与训练入口相同的 python3；如需已激活环境之外的解释器，可覆盖 MT_PYTHON。
+MT_PYTHON="${MT_PYTHON:-python3}"
 export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
 export PYTEST_DISABLE_PLUGIN_AUTOLOAD="${PYTEST_DISABLE_PLUGIN_AUTOLOAD:-1}"
 export RAY_USAGE_STATS_ENABLED="${RAY_USAGE_STATS_ENABLED:-0}"
 
-MT_PYTHON="${MT_PYTHON:-python3}"
+# 测试目标相对插件仓根解析；也可设为 tests/unit 或一个绝对路径。
 D1_TEST_TARGET="${D1_TEST_TARGET:-tests/unit/test_borrowed_contract.py}"
-D1_LOG_DIR="${D1_LOG_DIR:-${VERL_MULTI_TASK_ROOT}/logs}"
+[ -d "${VERL_MULTI_TASK_ROOT}/src/multi_task_scheduler" ] || {
+    echo "插件源码目录不存在：${VERL_MULTI_TASK_ROOT}/src/multi_task_scheduler" >&2
+    exit 1
+}
+# pytest 需要在插件仓根解析 tests/，不依赖用户从哪个目录调用脚本。
+cd "${VERL_MULTI_TASK_ROOT}"
+[ -e "${D1_TEST_TARGET%%::*}" ] || {
+    echo "D1 测试目标不存在：${D1_TEST_TARGET}；请确认插件已更新到 D1。" >&2
+    exit 1
+}
+
+# 日志目录默认与 multi_task_run.sh 一致，可单独设置 D1_LOG_DIR。
+LOG_DIR="${LOG_DIR:-${VERL_REPO_DIR}/logs}"
+D1_LOG_DIR="${D1_LOG_DIR:-${LOG_DIR}}"
 mkdir -p "${D1_LOG_DIR}"
 D1_LOG_FILE="${D1_LOG_DIR}/d1_test_$(date +%Y%m%d%H%M%S).log"
+
+# ------------------------------ D1 测试命令 ------------------------------
+
+CMD=( "${MT_PYTHON}" -m pytest -q -p no:cacheprovider "${D1_TEST_TARGET}" )
+# 与训练入口相同，用命令行参数追加覆盖；这里接收 pytest 参数，例如 -x 或 -vv。
+if [ "$#" -gt 0 ]; then
+    CMD+=( "$@" )
+fi
 
 echo "VERL_REPO_DIR=${VERL_REPO_DIR}"
 echo "VERL_SOURCE_ROOT=${VERL_SOURCE_ROOT}"
 echo "VERL_MULTI_TASK_ROOT=${VERL_MULTI_TASK_ROOT}"
+echo "PYTHONPATH=${PYTHONPATH}"
 echo "MT_PYTHON=${MT_PYTHON}"
 echo "D1_TEST_TARGET=${D1_TEST_TARGET}"
 echo "D1_LOG_FILE=${D1_LOG_FILE}"
 
-cd "${VERL_MULTI_TASK_ROOT}"
-
-# Do not use pipefail: older server Bash versions do not support it.  Capture
-# the pytest status immediately so tee cannot hide a failing test.
+# 立即保存整个管道的退出码，避免 tee 成功掩盖 pytest 的失败。
 set +e
-"${MT_PYTHON}" -m pytest -q -p no:cacheprovider "${D1_TEST_TARGET}" 2>&1 | tee "${D1_LOG_FILE}"
+"${CMD[@]}" 2>&1 | tee "${D1_LOG_FILE}"
 COMMAND_STATUSES=( "${PIPESTATUS[@]}" )
 set -e
 
@@ -101,4 +110,4 @@ if [ "${COMMAND_STATUSES[1]}" -ne 0 ]; then
     exit "${COMMAND_STATUSES[1]}"
 fi
 
-echo "D1 测试通过；日志：${D1_LOG_FILE}"
+echo "D1 契约测试通过（未验证 NPU runtime）；日志：${D1_LOG_FILE}"

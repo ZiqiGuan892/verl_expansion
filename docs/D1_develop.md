@@ -19,7 +19,7 @@ D0 已由用户完成真实环境验收并确认通过。本阶段依据 [verl �
 | `src/multi_task_scheduler/integration/verl/experimental_fully_async/llm_server_manager.py` | 扩展 `MultiTaskLLMServerManager` 的 D1 状态、spec 校验、rank 分配、幂等记录、创建/回收预留入口 | manager 是本任务本地 runtime 和操作记录的所有者；它不能把 ActorHandle 或 PG handle 传给 GS |
 | `src/multi_task_scheduler/rollout/replica.py` | 扩展 `MultiTaskvLLMReplica` 的 allocation/lease/claim/runtime 元数据；增加显式未实现的 `init_from_lease`、`destroy`、`reclaim` | borrowed 必须继续兼容 `vLLMReplica` 的外部对象契约，D1 只先建立字段和生命周期边界 |
 | `tests/unit/test_borrowed_contract.py` | 新增隔离单元测试 | 不导入 Ray、vLLM、NPU；直接执行扩展类真实方法体，验证 D1 的纯状态逻辑 |
-| `D1_test.sh` | 新增服务器一键测试入口 | 按当前 `verl`/`verl_multi_task` 目录布局设置 `PYTHONPATH`，执行 D1 契约测试并保存日志；兼容旧 Bash，不依赖 `pipefail` |
+| `D1_test.sh` | 新增服务器一键测试入口 | 对齐用户已跑通的 `multi_task_run.sh`：固定 `verl/multi_task_verl` 路径、加载相同 Ascend 环境、设置相同 `PYTHONPATH`，执行 D1 契约测试并保存日志；兼容旧 Bash，不依赖 `pipefail` |
 | `docs/develop_step.md` | 将 D1 标记为代码开发完成，链接本记录 | 保持阶段门禁和开发日志与代码状态一致 |
 | `Agent.md` | 更新交接门禁为 D1，记录当前新增文件及 D2 禁止提前开发 | 防止下一位 Agent 将 D1 代码误认为 D2 runtime 已完成 |
 
@@ -157,29 +157,42 @@ serving_version: int | None
 
 ### 4.2 服务器上的验证命令
 
-在 D0 已通过的 Linux/NPU 环境中，从插件仓根执行。推荐先使用仓库根目录的一键入口：
+将 `D1_test.sh` 放到服务器上 `multi_task_run.sh` 所在目录。2026-09-22 起，脚本直接沿用用户已跑通版本的路径配置，不再自动猜测插件目录名：
 
-```bash
-cd /absolute/path/to/verl-multi-task
-export MT_VERL_SOURCE_ROOT=/absolute/path/to/compatible-verl
-export PYTHONPATH="$PWD/src:$MT_VERL_SOURCE_ROOT${PYTHONPATH:+:$PYTHONPATH}"
-export PYTHONDONTWRITEBYTECODE=1
-export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
-export RAY_USAGE_STATS_ENABLED=0
-export MT_PYTHON=/absolute/path/to/the/d0/python
-
-MT_PYTHON="$MT_PYTHON" VERL_REPO_DIR=/absolute/path/to/verl-repo \
-  D1_TEST_TARGET=tests/unit/test_borrowed_contract.py \
-  bash ./D1_test.sh
-
+```text
+VERL_REPO_DIR/
+├── multi_task_run.sh
+├── D1_test.sh
+└── verl/
+    ├── verl/                # 原生 Python 包
+    └── multi_task_verl/      # 插件仓库，包含 src/ 和 tests/
 ```
 
-其中 `VERL_REPO_DIR` 指向包含 `verl/verl` 和 `verl/verl_multi_task`（或 `verl/multi_task_verl`）的目录；脚本也支持从 `verl` 子目录执行。需要手工运行或扩大测试范围时，再执行：
+在 D0 已通过的环境中，按训练入口相同的调用方式执行：
 
 ```bash
-cd /absolute/path/to/verl-multi-task
-export MT_VERL_SOURCE_ROOT=/absolute/path/to/compatible-verl
-export PYTHONPATH="$PWD/src:$MT_VERL_SOURCE_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+cd /absolute/path/to/VERL_REPO_DIR/verl
+bash ../D1_test.sh
+# 可选：使用指定解释器，遇到首个失败即退出，并输出详细测试名。
+MT_PYTHON=/absolute/path/to/python3 bash ../D1_test.sh -x -vv
+```
+
+脚本默认使用 `python3`，与训练入口一致；该解释器需要已经安装 pytest。`VERL_REPO_DIR`、`VERL_SOURCE_ROOT`、`VERL_MULTI_TASK_ROOT`、`ASCEND_TOOLKIT_ENV`、`ASCEND_ATB_ENV` 均可按训练入口的方式覆盖。若直接从插件仓内运行脚本，必须显式指定 `VERL_REPO_DIR` 为上图最外层目录。
+
+| 配置 | 与已跑通 `multi_task_run.sh` 的关系 |
+| --- | --- |
+| 目录与 Python 搜索路径 | 相同的 `BASH_SOURCE[0]` 定位、三个根目录默认值及两次 `PYTHONPATH` 设置；先进入原生源码根 |
+| Ascend 环境 | 相同的 Toolkit/ATB 脚本路径、加载顺序和 NPU/HCCL/vLLM 环境变量默认值 |
+| 缓存和日志 | `HF_DATASETS_CACHE=${VERL_REPO_DIR}/cache`；`LOG_DIR=${VERL_REPO_DIR}/logs`，D1 可用 `D1_LOG_DIR` 单独覆盖 |
+| 执行入口 | D1 改为进入插件根执行 pytest；追加参数为 pytest 参数，不接收 Hydra 配置 |
+| 模型、数据和训练配置 | D1 契约测试不消费这些参数，因此无需模型、数据集、训练资源或 runtime profile 配置 |
+| 必要测试设置 | 禁用 pytest 第三方插件自动加载和缓存，检查测试目标存在，使用 `PIPESTATUS` 传播测试/日志错误以兼容旧 Bash |
+
+需要手工运行或扩大测试范围时，可执行：
+
+```bash
+cd /absolute/path/to/VERL_REPO_DIR/verl/multi_task_verl
+export PYTHONPATH="$PWD/src:/absolute/path/to/VERL_REPO_DIR/verl${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONDONTWRITEBYTECODE=1
 export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
 export RAY_USAGE_STATS_ENABLED=0
@@ -189,7 +202,7 @@ export MT_PYTHON=/absolute/path/to/the/d0/python
 "$MT_PYTHON" -m pytest -q -p no:cacheprovider tests/unit
 ```
 
-D1 一键入口默认只运行 `tests/unit/test_borrowed_contract.py`，可通过 `D1_TEST_TARGET` 指定其他测试路径。脚本会把输出写入 `logs/d1_test_<时间戳>.log`。D1 测试预期不会启动 GPU、Ray Actor 或 vLLM server。`tests/native_unit` 仍需在配套 verl/vLLM 环境中单独运行；它验证父类关系，不代表 D1 runtime 创建成功。
+D1 一键入口默认只运行 `tests/unit/test_borrowed_contract.py`，可通过 `D1_TEST_TARGET` 指定其他测试路径或 pytest node ID。默认日志为 `${VERL_REPO_DIR}/logs/d1_test_<时间戳>.log`。加载 Ascend 环境只为保持与服务器入口一致，不表示本测试会使用 NPU；默认 D1 测试不会启动 GPU、Ray Actor 或 vLLM server。`tests/native_unit` 仍需在配套 verl/vLLM 环境中单独运行；它验证父类关系，不代表 D1 runtime 创建成功。
 
 ### 4.3 本工作区执行结果
 
