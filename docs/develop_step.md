@@ -4,7 +4,7 @@
 
 本版取代旧计划的 D00—D14。D0 与历史 D00 是同一步；交接文件中的“D01 尚未获准开始”，对应本版 D1 的进入门禁。旧计划中的全量生命周期实现不再是本轮交付目标。
 
-**当前状态：D0 已由用户确认验收通过；D1 代码开发完成，验证结果和限制记录在 [D1_develop.md](D1_develop.md)，等待用户确认后才能进入 D2。D2—D4 未开始。**
+**当前状态：D0 已由用户确认验收通过；D1 已由用户确认验收通过；D2 代码开发完成，详细记录在 [D2_develop.md](D2_develop.md)，等待真实 Ray/GPU 验收。D3—D4 未开始。**
 
 ## 1. 本轮范围与实现边界
 
@@ -81,13 +81,15 @@
 
 ### D2：按 claims 创建独立 borrowed runtime
 
+**本阶段实现记录：** [D2_develop.md](D2_develop.md)。当前已完成代码和隔离单元测试；真实 Ray/GPU 矩阵待在服务器执行。以下表格保留阶段级开发与验收门禁，具体方法、字段、时序和失败语义见 D2 日志。
+
 **目标：** 由 manager 调用真实 `init_from_lease(spec)`，得到包含独立 CE Workers、HTTP server 和 engine 的 RUNTIME_READY replica。此时不向 LB 发布新 server。
 
 **修改范围：** `rollout/replica.py`、`llm_server_manager.py`、现有 profile/config 校验和真实环境测试。HTTP 启动尽量复用 `http_server.py` 的父类；CE Worker 不增加新行为。
 
 | 顺序 | 开发内容 | 完成后立即验证 |
 | --- | --- | --- |
-| native 配额与 PG 可达性 | 从配置向 native PG 初始化传递 M，保留原生资源池机制；borrowed 解析已有 PG，核对 namespace、bundle、容量和 donor 存活；名称加入任务/lease/rank 区分 | 两个真实 Ray job 解析同一 donor PG；profile/native 创建仍正确；修改 M 不会改变已有 PG 的容量 |
+| native 配额与 PG 可达性 | 保持 native `init_standalone()` 和原生资源池不变；borrowed 只解析已有 PG，核对 namespace、bundle 和 donor 可达性；名称加入任务/lease/rank 区分 | 两个真实 Ray job 解析同一 donor PG；profile/native 创建仍正确；borrowed 不新建 PG |
 | CE Workers | 实现 `validate_placement()` 与 `_create_workers_from_claims()`：逐 claim 使用新的 `RayClassWithInitArgs`，明确 PG/bundle、CPU/GPU 请求；生成 borrower 独立 rank/world/master 环境，再用 `RayWorkerGroup.from_detached()` 包装新 handles | 先只启动 CE Workers，读取实际 node/device 和 rank；确认数量、落点、资源份额及命名正确，borrower/donor handles 不相同 |
 | server 与 engine | 按 borrower node_rank/local_rank 排序 workers，设置 world_size、nnodes、gpus_per_replica_node；调用继承的 `launch_servers()`，由原生 NodeAffinity/server 启动链创建 HTTP/headless engine；实现 `validate_runtime()` | 核对 server 节点、可见设备、engine PID、endpoint 和健康状态；失败不能发布地址为可服务路由 |
 | 提交结果及失败记录 | manager 在返回前重新检查 lease/取消状态，保存本地 replica 和实际映射，返回 RUNTIME_READY；逐次记录已创建资源，异常时保留精确句柄/Actor 名称与错误 | PG 消失、放置超时、设备不符、部分 Worker/engine 启动失败时，不进入 READY、不误删 donor PG、不谎报 claims 已归还 |
@@ -105,7 +107,7 @@
 
 多 CE Worker 的 fractional 资源分配只证明 Ray 放置能力，不证明显存隔离，也不能推出同一 vLLM 并行组的多个 rank 可重复使用一张物理卡。共卡 engine 必须另有足够显存、独立端口/IPC，并以真实运行结果确认；不能把同卡多个 CE Worker 当成多张物理卡。
 
-**验收文件：** 计划新增 `tests/gpu/test_borrowed_runtime.py`，扩充 D1 校验用例及已有 native 适配测试。测试使用预先授权、运行空间已释放的 donor PG；不能把仍在运行的 donor engine 部分 rank 直接拿走。
+**验收文件：** 已新增 `tests/unit/test_borrowed_runtime.py`，扩充 D1 校验用例及已有 native 适配测试；真实 GPU/Ray 验收仍需在服务器补充。测试使用预先授权、运行空间已释放的 donor PG；不能把仍在运行的 donor engine 部分 rank 直接拿走。
 
 **通过条件：** 对矩阵分别记录实际 Actor/device/PG 映射和成功或失败证据；缺少跨 job、多卡或跨机环境时，相关能力仍为待验收，不能据此进入依赖这些结论的下一阶段。创建失败只要求可定位、不可接流和释放状态真实；完整自动回收不属于 D2。用户确认后进入 D3。
 

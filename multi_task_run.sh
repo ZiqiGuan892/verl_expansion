@@ -31,8 +31,7 @@ echo $PYTHONPATH
 #
 # 默认：1 节点 8 张 Ascend NPU，训练 4 张、rollout 4 张。
 #
-# 服务器 Bash 版本可能不支持 pipefail；该入口只使用基础错误退出选项。
-set -eu
+set -euo pipefail
 set -x
 
 
@@ -60,7 +59,7 @@ ASCEND_ATB_ENV="${ASCEND_ATB_ENV:-/usr/local/Ascend/nnal/atb/set_env.sh}"
 set +e +u
 source "${ASCEND_TOOLKIT_ENV}"
 source "${ASCEND_ATB_ENV}"
-set -eu
+set -euo pipefail
 
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES="${RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES:-1}"

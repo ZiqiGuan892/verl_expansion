@@ -1,10 +1,4 @@
-"""Select rollout subclasses and own D1 borrowed-replica contracts.
-
-The D1 implementation deliberately stops before creating a Ray actor.  It
-normalises and validates the metadata contract, allocates a stable task-local
-replica rank, and records an explicit non-success receipt.  Runtime creation
-from claims is D2 and must not be hidden behind this module yet.
-"""
+"""Select rollout subclasses and create borrowed runtimes from GS claims."""
 
 import asyncio
 import copy
@@ -226,6 +220,34 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         if missing:
             raise ValueError(f"lease_ids do not cover claim leases: {sorted(missing)}")
 
+        raw_parallelism = source.get("parallelism")
+        if raw_parallelism is not None and not isinstance(raw_parallelism, dict):
+            raise ValueError("parallelism must be a mapping when provided")
+        parallelism = copy.deepcopy(raw_parallelism or {})
+        for key in ("tensor_model_parallel_size", "data_parallel_size", "pipeline_model_parallel_size"):
+            if key in parallelism:
+                value = parallelism[key]
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    raise ValueError(f"parallelism.{key} must be a positive integer")
+        parallelism.setdefault("tensor_model_parallel_size", world_size)
+        parallelism.setdefault("data_parallel_size", 1)
+        parallelism.setdefault("pipeline_model_parallel_size", 1)
+        if (
+            parallelism["tensor_model_parallel_size"]
+            * parallelism["data_parallel_size"]
+            * parallelism["pipeline_model_parallel_size"]
+            != world_size
+        ):
+            raise ValueError("parallelism TP*DP*PP must equal world_size")
+        creation_timeout_s = source.get("creation_timeout_s", 600.0)
+        if (
+            isinstance(creation_timeout_s, bool)
+            or not isinstance(creation_timeout_s, (int, float))
+            or not math.isfinite(float(creation_timeout_s))
+            or float(creation_timeout_s) <= 0
+        ):
+            raise ValueError("creation_timeout_s must be a finite positive number")
+
         return {
             "operation_id": operation_id,
             "lease_id": lease_id,
@@ -239,6 +261,8 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             "max_colocate_count": max_colocate_count,
             "expires_at": float(expires_at),
             "placement_epoch": placement_epoch,
+            "parallelism": parallelism,
+            "creation_timeout_s": float(creation_timeout_s),
         }
 
     def _used_replica_ranks(self) -> set[int]:
@@ -275,7 +299,17 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
 
     def _receipt(self, record: dict) -> dict:
         """Return only serializable operation metadata; never leak handles."""
-        return copy.deepcopy(record["result"])
+        if record.get("result") is not None:
+            return copy.deepcopy(record["result"])
+        return {
+            "operation_id": record["operation_id"],
+            "lease_id": record["lease_id"],
+            "lease_ids": list(record["source_lease_ids"]),
+            "replica_rank": record["replica_rank"],
+            "state": record["state"],
+            "released": False,
+            "error": {"code": "OPERATION_IN_PROGRESS", "message": "borrowed runtime creation is still running"},
+        }
 
     @staticmethod
     def _same_request(record: dict, spec: dict) -> bool:
@@ -300,14 +334,15 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         return previous == current
 
     async def create_borrowed_replica(self, spec: dict) -> dict:
-        """Register a D1 create request without starting a runtime.
+        """Create a borrowed runtime while keeping operation metadata idempotent.
 
-        D2 will replace the explicit failure below with the claim-based runtime
-        creation path.  Keeping the failure explicit prevents callers from
-        treating a metadata-only record as ``RUNTIME_READY``.
+        The lock protects rank allocation and duplicate detection only.  Ray
+        actor creation is deliberately outside the lock so a slow vLLM
+        startup cannot block an unrelated lease request.
         """
         normalized = self._validate_create_spec(spec)
         lease_id = normalized["lease_id"]
+        record = None
         async with self.replica_operation_lock:
             existing = self.borrowed_operations.get(lease_id)
             if existing is not None:
@@ -318,9 +353,9 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 if record.get("operation_id") == normalized["operation_id"]:
                     raise ValueError(f"operation_id {normalized['operation_id']} is already in use")
 
-            request_spec = copy.deepcopy(normalized)
             replica_rank = self._allocate_replica_rank_locked(normalized["replica_rank"])
             normalized["replica_rank"] = replica_rank
+            request_spec = copy.deepcopy(normalized)
             record = {
                 "operation_id": normalized["operation_id"],
                 "lease_id": lease_id,
@@ -340,13 +375,52 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             }
             self.borrowed_operations[lease_id] = record
 
-            # No runtime creation is allowed in D1.  The rank and frozen
-            # request remain recorded so a retry cannot allocate another rank.
-            record["state"] = "FAILED"
-            record["error"] = {
-                "code": "RUNTIME_CREATION_NOT_IMPLEMENTED",
-                "message": "D1 records the contract only; borrowed runtime creation is a D2 operation",
-            }
+
+        replica = None
+        try:
+            replica = MultiTaskvLLMReplica(
+                replica_rank=replica_rank,
+                config=self.rollout_config,
+                model_config=getattr(self, "model_config", None),
+                # The parent constructor validates the native world-size layout.
+                # Borrowed claims may have a different or fragmented layout, so
+                # use a trivially divisible placeholder and replace the topology
+                # after claims have been validated in init_from_lease().
+                gpus_per_node=1,
+                allocation_kind="borrowed",
+                lease_id=lease_id,
+                source_lease_ids=normalized["source_lease_ids"],
+                donor_task_ids=list(dict.fromkeys(claim["donor_task_id"] for claim in normalized["claims"])),
+                donor_replica_ranks=list(dict.fromkeys(claim["donor_replica_rank"] for claim in normalized["claims"])),
+                owns_resource_pool=False,
+                max_colocate_count=normalized["max_colocate_count"],
+                claims=normalized["claims"],
+                operation_id=normalized["operation_id"],
+            )
+            runtime = await replica.init_from_lease(normalized)
+        except Exception as exc:
+            async with self.replica_operation_lock:
+                record["state"] = "FAILED"
+                record["error"] = {"code": "RUNTIME_CREATION_FAILED", "message": str(exc)}
+                cleanup = getattr(replica, "cleanup_result", None) if replica is not None else None
+                record["result"] = {
+                    "operation_id": record["operation_id"],
+                    "lease_id": record["lease_id"],
+                    "lease_ids": record["source_lease_ids"],
+                    "replica_rank": record["replica_rank"],
+                    "state": record["state"],
+                    "released": False,
+                    "error": record["error"],
+                    "cleanup": copy.deepcopy(cleanup),
+                }
+            return self._receipt(record)
+
+        async with self.replica_operation_lock:
+            record["state"] = "RUNTIME_READY"
+            record["replica"] = replica
+            record["worker_handles"] = list(replica.workers)
+            record["server_handles"] = list(replica.servers)
+            record["created_actor_names"] = list(replica.created_actor_names)
             record["result"] = {
                 "operation_id": record["operation_id"],
                 "lease_id": record["lease_id"],
@@ -354,7 +428,8 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 "replica_rank": record["replica_rank"],
                 "state": record["state"],
                 "released": False,
-                "error": record["error"],
+                "runtime": runtime,
+                "error": None,
             }
             return self._receipt(record)
 
@@ -377,7 +452,7 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 "released": False,
                 "error": {
                     "code": "LIFECYCLE_NOT_IMPLEMENTED",
-                    "message": "D1 reserves reclaim_replica; runtime cleanup is a later lifecycle stage",
+                    "message": "reclaim_replica is reserved; production runtime cleanup is a later lifecycle stage",
                 },
             }
 

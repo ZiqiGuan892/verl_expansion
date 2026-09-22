@@ -132,7 +132,7 @@ def test_manager_preselects_replica_and_forwards_native_load_balancer_flags():
     manager_class = _isolated_class(
         f"{INTEGRATION}/llm_server_manager.py", "MultiTaskLLMServerManager", Parent,
         MultiTaskvLLMReplica=replica_class, MultiTaskGlobalRequestLoadBalancer=load_balancer_class,
-        DEFAULT_ROUTING_CACHE_SIZE=123, ray=ray_substitute,
+        DEFAULT_ROUTING_CACHE_SIZE=123, ray=ray_substitute, asyncio=asyncio,
     )
     config, pool, scheduler = object(), object(), object()
     manager = manager_class(config, rollout_resource_pool=pool, group_scheduler=scheduler)

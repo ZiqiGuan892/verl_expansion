@@ -1,9 +1,9 @@
 """D1 contract tests using isolated class bodies.
 
 These tests intentionally do not import verl, Ray, vLLM, or NPU backends.  The
-manager and replica classes are executed with a small substituted native
-parent so the tests cover the real D1 method bodies without claiming runtime
-creation success.
+manager and replica classes are executed with small substituted native
+parents; runtime creation is covered by a deterministic fake replica while
+placement/engine integration remains a GPU/Ray acceptance test.
 """
 
 import ast
@@ -53,13 +53,30 @@ class _ManagerParent:
         self.alive_replicas = {}
 
 
+class _FakeBorrowedReplica:
+    def __init__(self, **kwargs):
+        self.replica_rank = kwargs["replica_rank"]
+        self.workers = [f"worker-{self.replica_rank}"]
+        self.servers = [f"server-{self.replica_rank}"]
+        self.created_actor_names = [f"actor-{self.replica_rank}"]
+
+    async def init_from_lease(self, spec):
+        return {
+            "replica_rank": self.replica_rank,
+            "lease_id": spec["lease_id"],
+            "state": "RUNTIME_READY",
+            "world_size": spec["world_size"],
+            "server_address": "127.0.0.1:1",
+        }
+
+
 def _manager_class():
     return _isolated_class(
         "integration/verl/experimental_fully_async/llm_server_manager.py",
         "MultiTaskLLMServerManager",
         _ManagerParent,
         ray=SimpleNamespace(remote=Mock()),
-        MultiTaskvLLMReplica=object,
+        MultiTaskvLLMReplica=_FakeBorrowedReplica,
         MultiTaskGlobalRequestLoadBalancer=object,
     )
 
@@ -141,7 +158,7 @@ def test_validate_create_spec_rejects_invalid_contract(mutator, pattern):
         manager._validate_create_spec(value)
 
 
-def test_create_contract_is_idempotent_and_does_not_start_runtime():
+def test_create_contract_is_idempotent_and_records_runtime_receipt():
     manager = _manager()
     request = _spec()
     first = asyncio.run(manager.create_borrowed_replica(request))
@@ -150,12 +167,12 @@ def test_create_contract_is_idempotent_and_does_not_start_runtime():
     second = asyncio.run(manager.create_borrowed_replica(retry))
 
     assert first == second
-    assert first["state"] == "FAILED"
+    assert first["state"] == "RUNTIME_READY"
     assert first["released"] is False
-    assert first["error"]["code"] == "RUNTIME_CREATION_NOT_IMPLEMENTED"
+    assert first["error"] is None
     assert first["replica_rank"] == 0
     assert len(manager.borrowed_operations) == 1
-    assert manager.borrowed_operations["borrower-lease-1"]["replica"] is None
+    assert manager.borrowed_operations["borrower-lease-1"]["replica"] is not None
 
     different = _spec(
         operation_id="operation-2",
@@ -217,6 +234,8 @@ def test_rank_is_monotonic_and_retire_requires_the_owner():
 class _ReplicaParent:
     def __init__(self, *args, **kwargs):
         self.replica_rank = kwargs.get("replica_rank", args[0] if args else 0)
+        self.workers = []
+        self.servers = []
 
 
 def _replica_class():
@@ -251,7 +270,7 @@ def test_replica_contract_keeps_native_and_borrowed_metadata_separate():
     assert borrowed.owns_resource_pool is False
     assert borrowed.claims == [{"claim_id": "claim-0"}]
 
-    with pytest.raises(NotImplementedError, match="deferred to D2"):
+    with pytest.raises(ValueError, match="one claim per world rank"):
         asyncio.run(borrowed.init_from_lease({}))
     assert borrowed.runtime_state == "FAILED"
     mismatch = asyncio.run(borrowed.reclaim("other-lease"))

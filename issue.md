@@ -89,20 +89,3 @@ ray.get(self.group_scheduler.attach_task.remote(task_id, context.current_actor),
 环境变量、重复 RPC、ActorHandle 兼容分支或额外日志；超时之后仍按原有异常传播和清理逻辑
 处理。
 
-## 验证
-
-本地工作区没有完整 Ray/Ascend 运行环境，因此不能用本地测试声明真实启动成功。已完成：
-
-```text
-git diff --check
-```
-
-服务器上使用与 D0 相同的环境重新运行：
-
-```bash
-bash ../multi_task_run.sh 2>&1 | tee d1_startup.log
-```
-
-通过标准是：日志不再因为 `DEFAULT_ROUTING_CACHE_SIZE` 导入失败；TaskRunner 等待 GS 注册
-最多 120 秒，并继续进入原生 Trainer/Rollouter 初始化。如果 120 秒后仍失败，应读取 GS
-Actor 和 Ray worker 的最内层 traceback，不能仅凭超时判断为成功或资源已释放。
