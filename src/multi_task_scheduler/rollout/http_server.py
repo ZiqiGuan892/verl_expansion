@@ -29,21 +29,3 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
         self._require_test_sleep_mode()
         await self.engine.wake_up(tags=["weights", "kv_cache"])
         await self.engine.reset_prefix_cache(reset_connector=True)
-
-    async def hold_kv_cache_for_ce_test(self) -> None:
-        """Keep the unrouted borrower weight-ready without a resident KV cache.
-
-        D3 still tests a real full-member CE sync after bootstrap. Only the
-        donor serves requests; retaining two KV pools on its cards is needless.
-        Native CE release/receive/finalize continue unchanged.
-        """
-        if self.node_rank != 0:
-            return
-        self._require_test_sleep_mode()
-        await self.release_kv_cache()
-        self._hold_kv_cache_for_ce_test = True
-
-    async def resume_kv_cache(self):
-        if getattr(self, "_hold_kv_cache_for_ce_test", False):
-            return
-        return await super().resume_kv_cache()

@@ -241,11 +241,11 @@ desired GPU memory utilization (0.3, 8.85 GiB)
 找到当前任务的 native donors，并对 donor 的所有 server 调用该测试接口。borrowed 创建
 完成后，测试清理阶段先让 borrowed 进入 sleep，再销毁其本次测试 Actor，最后恢复 donor。
 
-D3 bootstrap 额外调用 `hold_kv_cache_for_ce_test()`，只释放 borrowed KV、保留权重以便
-CE 继续执行；随后 `restore_d3_donors()` 恢复 donor 并输出
-`D3_MEMORY_RESULT ... DONORS_RESTORED_BORROWER_KV_RELEASED`。该安排只用于小模型的
-单节点 D3 smoke：borrowed 的模型权重与 donor 恢复后的模型权重仍可能共占设备显存，若
-更大模型或显存余量不足，应在 borrowed 活跃期间保持 donor asleep。
+D3 bootstrap 后不会立即恢复 donor。Trainer 将已经 sleep 的 donor rank 写入 CE Manager
+的暂时排除集合，普通同步只构造 actor worker + borrowed worker 的 HCCL 拓扑。这样 donor
+CE Worker 不会和 borrowed CE Worker 在同一物理 NPU 上重复加入 HCCL communicator，避免
+`hcclCommInitRank(...): HCCL error: parameter error`。普通同步完成后，测试清理 borrowed
+并恢复 donor 的服务显存，再清除 CE 排除集合。
 
 ### 5.3 验证
 
@@ -263,6 +263,6 @@ D3_RUNTIME_SCENARIOS=basic bash ../D3_test.sh
 ```
 
 应依次看到 `RUNTIME_TEST_DONORS_SLEEPING`、`D3_BOOTSTRAP_RESULT`、
-`DONORS_RESTORED_BORROWER_KV_RELEASED` 和 `D3_NORMAL_SYNC_RESULT`。如果再次出现
+`DONORS_SLEEPING_BORROWER_ONLY_EFFECTIVE` 和 `D3_NORMAL_SYNC_RESULT`。如果再次出现
 `Free memory on device ... less than desired GPU memory utilization`，需保存完整 Worker
 日志，确认目标 vllm-ascend 版本确实实现了 level-1 sleep 的显存释放。

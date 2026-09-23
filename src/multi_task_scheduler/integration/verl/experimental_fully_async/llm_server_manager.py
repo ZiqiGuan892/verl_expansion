@@ -94,17 +94,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         """Call an opt-in memory fixture on every node of one test replica."""
         await asyncio.gather(*(getattr(server, method).remote() for server in replica.servers))
 
-    async def restore_d3_donors(self, replica_rank: int) -> dict:
-        """Release borrowed KV before restoring donors for the training loop."""
-        record = self._borrowed_record_by_rank(replica_rank)
-        await self._test_memory_call(record["replica"], "hold_kv_cache_for_ce_test")
-        for donor in record.get("sleeping_donors", []):
-            await self._test_memory_call(donor, "wake_for_runtime_test")
-        record["sleeping_donors"] = []
-        result = {"replica_rank": replica_rank, "state": "DONORS_RESTORED_BORROWER_KV_RELEASED"}
-        print(f"D3_MEMORY_RESULT {json.dumps(result, sort_keys=True)}")
-        return result
-
     async def get_replica_for_ce(self, replica_rank: int):
         """Return the local borrowed replica projection for Trainer CE wiring."""
         if isinstance(replica_rank, bool) or not isinstance(replica_rank, int) or replica_rank < 0:
@@ -741,7 +730,13 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 await self._test_memory_call(donor, "wake_for_runtime_test")
             if record is not None:
                 record["sleeping_donors"] = []
-        result = {"scenario": scenario, "status": "PASS", "receipt": receipt, "cleanup": cleanup}
+        result = {
+            "scenario": scenario,
+            "status": "PASS",
+            "receipt": receipt,
+            "cleanup": cleanup,
+            "sleeping_donor_ranks": [int(donor.replica_rank) for donor in sleeping_donors],
+        }
         print(f"D2_RUNTIME_RESULT {json.dumps(result, sort_keys=True, default=str)}")
         return result
 

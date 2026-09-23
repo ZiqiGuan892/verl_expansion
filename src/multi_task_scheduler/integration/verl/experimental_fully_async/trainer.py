@@ -36,6 +36,7 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
         self._d3_bootstrap_rank = None
         self._d3_cleanup_after_test = True
         self._d3_bootstrap_result = None
+        self._d3_suspended_donor_ranks = []
 
     async def _setup_checkpoint_manager(self):
         """Preserve native trainer.py:217-224; replace only the Manager class."""
@@ -89,7 +90,16 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
             registration = await self.register_replica(replica_rank)
             registered = registration.get("state") in {"REGISTERED", "ALREADY_REGISTERED"}
             bootstrap = await self.bootstrap_replica(replica_rank)
-            memory = await self.rollouter.restore_d3_donors.remote(replica_rank)
+            donor_ranks = [int(rank) for rank in prepared.get("sleeping_donor_ranks", [])]
+            memory = await self.checkpoint_manager.suspend_replicas_for_sync(donor_ranks)
+            memory.update(
+                {
+                    "replica_rank": replica_rank,
+                    "state": "DONORS_SLEEPING_BORROWER_ONLY_EFFECTIVE",
+                }
+            )
+            self._d3_suspended_donor_ranks = donor_ranks
+            print(f"D3_MEMORY_RESULT {json.dumps(memory, sort_keys=True)}")
         except Exception:
             # The hook owns this test runtime.  Do best-effort local cleanup so
             # a failed bootstrap cannot leave vLLM/CE actors consuming the
@@ -105,6 +115,12 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
                     await self.rollouter.cleanup_d3_runtime.remote(replica_rank)
                 except Exception:
                     pass
+            if self._d3_suspended_donor_ranks:
+                try:
+                    await self.checkpoint_manager.resume_replicas_for_sync(self._d3_suspended_donor_ranks)
+                except Exception:
+                    pass
+                self._d3_suspended_donor_ranks = []
             raise
         self._d3_bootstrap_rank = replica_rank
         self._d3_bootstrap_result = {
@@ -140,6 +156,8 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
             if self._d3_cleanup_after_test:
                 await self.unregister_replica(rank)
                 cleanup = await self.rollouter.cleanup_d3_runtime.remote(rank)
+                await self.checkpoint_manager.resume_replicas_for_sync(self._d3_suspended_donor_ranks)
                 self._d3_bootstrap_result["cleanup"] = cleanup
+                self._d3_suspended_donor_ranks = []
             self._d3_bootstrap_rank = None
         return result

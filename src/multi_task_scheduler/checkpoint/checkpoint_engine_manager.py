@@ -28,6 +28,11 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         self.inflight_replicas = []
         self.last_synced_versions: dict[int, int] = {}
         self.pending_bootstrap: dict[int, int | None] = {}
+        # Replica ranks temporarily excluded from the effective CE set while
+        # their physical slots are leased to a borrowed replica.  The donor
+        # server is slept by the rollout manager; this set prevents its CE
+        # worker from joining a collective on the same device as the borrower.
+        self.suspended_replica_ranks: set[int] = set()
 
     @staticmethod
     def _replica_rank(replica) -> int:
@@ -59,7 +64,39 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             replica
             for replica in self.replicas
             if getattr(replica, "replica_rank", None) not in self.pending_bootstrap
+            and getattr(replica, "replica_rank", None) not in self.suspended_replica_ranks
         ]
+
+    @staticmethod
+    def _normalize_replica_ranks(replica_ranks) -> set[int]:
+        ranks = set(replica_ranks)
+        if any(isinstance(rank, bool) or not isinstance(rank, int) or rank < 0 for rank in ranks):
+            raise ValueError("replica_ranks must contain non-negative integers")
+        return ranks
+
+    async def suspend_replicas_for_sync(self, replica_ranks) -> dict:
+        """Exclude donor ranks from the next effective CE synchronization.
+
+        This is used by the D3 same-slot smoke only after the donor servers
+        have entered Engine sleep.  Leaving donor CE workers in the HCCL
+        topology would create duplicate ranks on the borrowed physical
+        devices and causes HCCL ``parameter error`` during communicator init.
+        """
+        ranks = self._normalize_replica_ranks(replica_ranks)
+        async with self.sync_gate:
+            known = {getattr(replica, "replica_rank", None) for replica in self.replicas}
+            missing = sorted(ranks - known)
+            if missing:
+                raise KeyError(f"unknown replica ranks: {missing}")
+            self.suspended_replica_ranks.update(ranks)
+            return {"state": "SUSPENDED", "replica_ranks": sorted(ranks)}
+
+    async def resume_replicas_for_sync(self, replica_ranks) -> dict:
+        """Allow previously suspended donor ranks into future CE snapshots."""
+        ranks = self._normalize_replica_ranks(replica_ranks)
+        async with self.sync_gate:
+            self.suspended_replica_ranks.difference_update(ranks)
+            return {"state": "RESUMED", "replica_ranks": sorted(ranks)}
 
     async def register_replica(self, replica) -> dict:
         """Add a RUNTIME_READY replica to the CE projection as pending.
@@ -100,6 +137,7 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
                 return {"replica_rank": rank, "state": "NOT_REGISTERED"}
             self.replicas = [item for item in self.replicas if getattr(item, "replica_rank", None) != rank]
             self.pending_bootstrap.pop(rank, None)
+            self.suspended_replica_ranks.discard(rank)
             self.last_synced_versions.pop(rank, None)
             if getattr(replica, "serving_version", None) is not None:
                 replica.serving_version = None

@@ -303,9 +303,11 @@ borrowed 前，`MultiTaskLLMServerManager` 对本任务 smoke 使用的 native d
 接口，之后才调用原有 `create_borrowed_replica()`，不改变原生 PG、Worker 或
 `launch_servers()` 的创建流程。
 
-D3 bootstrap 完成后，测试钩子释放 borrowed 的 KV cache，再恢复 donor；这样参数同步
-仍能验证 borrowed Worker，而 donor 可以继续服务主训练循环。该显存交接是 D2/D3 的
-一次性测试夹具，跨任务生产调度仍需由 donor 所属 TaskRunner 执行 sleep/wake。
+D3 bootstrap 完成后，测试钩子保持 donor asleep，并把 donor rank 从 CE 的暂时有效集合中
+排除；普通同步只使用 actor worker 和 borrowed worker。这样不会让 donor CE Worker 与
+borrowed CE Worker 在相同物理 NPU 上重复初始化 HCCL communicator。普通同步结束后，测试
+清理 borrowed、恢复 donor，再清除 CE 排除集合。该显存交接是 D2/D3 的一次性测试夹具，
+跨任务生产调度仍需由 donor 所属 TaskRunner 执行 sleep/wake。
 
 ### 回退范围与限制
 
@@ -351,3 +353,50 @@ To append to your config use +actor_rollout_ref.rollout.enable_sleep_mode=true
 
 这样会在旧 schema 中追加该测试字段；已有的 `free_cache_engine` 字段继续使用普通覆盖。
 MSC 的 `Profile "" not found` 日志是可选存储配置探测告警，不是本次 Hydra 失败的原因。
+
+## 8. D3 普通同步中 HCCL communicator 参数错误
+
+### 现象
+
+Hydra 配置修复后，D3 在第一次普通参数同步阶段失败：
+
+```text
+MultiTaskCheckpointEngineManager.update_weights
+  -> CheckpointEngineManager.build_process_group
+  -> HCCLCheckpointEngine.init_process_group
+  -> PyHcclCommunicator.hcclCommInitRank
+RuntimeError: HCCL error: parameter error
+```
+
+### 根因
+
+basic 场景的 native replica 和 borrowed replica 都是 TP=4，并且使用同一批 4 张物理
+NPU。target-only bootstrap 完成后，borrowed 从 `pending_bootstrap` 移出；原实现的普通
+同步会把 native 与 borrowed 的全部 CE Worker 合并到同一个 HCCL communicator。于是同一
+物理 device 被分配给多个 HCCL rank。即使 native vLLM server 已经 sleep，native CE Worker
+仍会占据该拓扑位置，HCCL 初始化会返回 `parameter error`。这不是 EngineCore OOM，也不
+是 `rebuild_group` 可以单独解决的问题。
+
+### 修复
+
+`MultiTaskCheckpointEngineManager` 新增 `suspended_replica_ranks` 和两个方法：
+
+```text
+suspend_replicas_for_sync(ranks)
+resume_replicas_for_sync(ranks)
+```
+
+D3 bootstrap 完成后，Trainer 暂时排除已经 sleep 的 donor rank，普通 CE 同步只包含
+actor workers 和 borrowed workers；同步完成、borrowed 清理并恢复 donor 后，再解除排除。
+`D3_test.sh` 检查 `DONORS_SLEEPING_BORROWER_ONLY_EFFECTIVE` 标记。
+
+### 验证
+
+本地目标测试：`38 passed`。服务器必须使用包含该修改的插件代码重新运行：
+
+```bash
+D3_RUNTIME_SCENARIOS=basic bash ../D3_test.sh
+```
+
+若日志仍显示 native 与 borrowed workers 同时进入 `build_process_group`，说明服务器没有
+加载最新插件代码或脚本仍使用旧版本。

@@ -158,6 +158,26 @@ def test_target_only_bootstrap_finalizes_then_full_sync_includes_borrowed_replic
     assert manager.last_synced_versions == {0: 8, 4: 8}
 
 
+def test_suspended_donors_are_excluded_from_hccl_effective_set():
+    events = []
+    manager, events, _ = _manager(events)
+    borrowed = _replica(4, "borrowed-worker")
+    target = _TargetGroup(events)
+    _RayWorkerGroup.target = target
+
+    asyncio.run(manager.register_replica(borrowed))
+    asyncio.run(manager.bootstrap_replica(borrowed, snapshot_version=7))
+    result = asyncio.run(manager.suspend_replicas_for_sync([0]))
+
+    assert result == {"state": "SUSPENDED", "replica_ranks": [0]}
+    asyncio.run(manager.update_weights(global_steps=8))
+    assert ("full_update", [4]) in events
+
+    asyncio.run(manager.resume_replicas_for_sync([0]))
+    asyncio.run(manager.update_weights(global_steps=9))
+    assert ("full_update", [0, 4]) in events
+
+
 def test_unregister_removes_pending_and_confirmed_version():
     manager, _, _ = _manager()
     borrowed = _replica(6, "borrowed-worker")
