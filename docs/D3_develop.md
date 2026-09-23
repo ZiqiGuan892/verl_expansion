@@ -97,6 +97,19 @@ Trainer 还覆盖了两个原生边界：
 
 正常入口仍由原生 `main_ppo` 调用；D3 只是通过配置开关插入测试路径。
 
+### 2.5 `src/multi_task_scheduler/checkpoint/hccl_checkpoint_engine.py`
+
+目标服务器使用 Ascend/NPU。当前 `vllm-ascend` 的 `PyHcclCommunicator` 将销毁函数放在
+底层 HCCL library wrapper 上，而原生 verl 的 `HCCLCheckpointEngine.finalize()` 直接调用
+communicator 的 `destroyComm`。因此新增 `MultiTaskHCCLCheckpointEngine`，只覆盖
+`finalize()`：兼容旧的 `destroyComm`，并在当前 API 下调用
+`pyhccl.hccl.hcclCommDestroy(pyhccl.comm)`；prepare、topology、send、receive 和
+ServerAdapter 参数流转全部继承原生实现。
+
+`D3_test.sh` 通过 `checkpoint_engine.custom_backend_module` 在所有相关 Worker 进程导入
+该模块，并将 backend 设为 `multitask_hccl`。这样不修改原生 `nccl`/HCCL registry，也
+不会依赖 import 顺序覆盖原生实现。
+
 ## 3. 测试设计
 
 ### 3.1 本地单元测试
@@ -127,10 +140,18 @@ python -m pytest -q -p no:cacheprovider \
 bash ../D3_test.sh
 ```
 
-脚本复用 `multi_task_run.sh` 的模型、数据、Ascend、Python 路径和训练配置，只追加：
+脚本复用 `multi_task_run.sh` 的模型、数据、Ascend、Python 路径和训练配置。由于当前
+Ascend 运行时的 `PyHcclCommunicator` 没有原生 HCCL 后端调用的 `destroyComm` 方法，
+D3 脚本选择插件内的 `multitask_hccl` 后端：它继承原生 HCCL 的传输逻辑，只替换
+通信域销毁适配，并通过 `custom_backend_module` 在训练 Worker、CE Worker 和 Trainer
+侧注册同一个后端。
+
+脚本只追加：
 
 ```text
-+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.nccl.rebuild_group=true
+actor_rollout_ref.rollout.checkpoint_engine.backend=multitask_hccl
+actor_rollout_ref.rollout.checkpoint_engine.custom_backend_module=multi_task_scheduler.checkpoint.hccl_checkpoint_engine
++actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.multitask_hccl.rebuild_group=true
 +multitask.d3_bootstrap_test.enabled=true
 +multitask.d3_bootstrap_test.scenario=split
 +multitask.d3_bootstrap_test.cleanup_after_test=true
@@ -156,7 +177,7 @@ D3_NORMAL_SYNC_RESULT {"state": "FULL_SYNC_READY", ...}
 本次开发环境已执行以下不依赖 Ray/GPU 的验证：
 
 ```text
-30 passed in 0.35s
+37 passed in 0.40s
 py_compile: passed
 git diff --check: passed（仅提示 Windows 换行转换）
 ```
@@ -185,7 +206,9 @@ D3 marker 和训练进程退出码均满足检查，才能将 D3 记为真实环
 ## 4. 当前限制与后续边界
 
 - 当前实现依赖分布式 checkpoint backend；`naive` backend 会明确拒绝 target-only bootstrap。
-- `rebuild_group=true` 必须在 CE Worker 创建前配置，不能在 actor 已启动后动态修改；D3 脚本显式设置 NCCL 选项。
+- `rebuild_group=true` 必须在 CE Worker 创建前配置，不能在 actor 已启动后动态修改；D3 脚本显式设置 `multitask_hccl` 选项。
 - `BLOCKED` 只表示本地 CE 事务失败，当前没有自动恢复通信域或重建 actor 的流程；完整错误恢复留待后续阶段。
 - `unregister_replica()` 不执行 server、engine、CE Worker 或 PG 的物理销毁；这些动作仍属于 lifecycle 阶段。
 - D3 不调用 LB `commit_ready()`，所以 bootstrap 成功后 replica 仍不会接收业务请求。接流和在途请求处理属于 D4/生命周期实现。
+- D3 的 Ascend HCCL 适配只为通信域销毁接口提供插件层兼容；若目标环境的
+  `vllm-ascend` API 不同，应调整该插件后端，不要修改原生 `verl/checkpoint_engine/hccl_checkpoint_engine.py`。

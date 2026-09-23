@@ -7,8 +7,9 @@
 # target-only bootstrap，并让 main_ppo 的第一次普通参数同步再次包含该 replica。
 #
 # 兼容服务器上的旧 Bash：不使用 pipefail，通过 PIPESTATUS 显式传播训练和
-# tee 的退出码。D3 需要 checkpoint_engine.backend=nccl；脚本显式打开
-# rebuild_group，保证 target-only 通信域 finalize 后可以重建全成员通信域。
+# tee 的退出码。本脚本沿用 multi_task_run.sh 的 Ascend NPU 环境，选用
+# multitask_hccl（继承原生 HCCL，仅修正 vllm-ascend 的通信域销毁接口）。
+# 显式打开 rebuild_group，保证 finalize 后可以重建全成员通信域。
 set -eu
 set -x
 
@@ -91,7 +92,9 @@ for scenario in $(printf '%s' "${D3_RUNTIME_SCENARIOS}" | tr ',' ' '); do
         "trainer.total_training_steps=${TOTAL_TRAINING_STEPS}" \
         "trainer.total_epochs=${TRAIN_TOTAL_EPOCHS}" \
         "rollout.total_rollout_steps=${TOTAL_ROLLOUT_STEPS}" \
-        "+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.nccl.rebuild_group=true" \
+        "actor_rollout_ref.rollout.checkpoint_engine.backend=multitask_hccl" \
+        "actor_rollout_ref.rollout.checkpoint_engine.custom_backend_module=multi_task_scheduler.checkpoint.hccl_checkpoint_engine" \
+        "+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.multitask_hccl.rebuild_group=true" \
         "+multitask.d3_bootstrap_test.enabled=true" \
         "+multitask.d3_bootstrap_test.scenario=${scenario}" \
         "+multitask.d3_bootstrap_test.cleanup_after_test=true" \

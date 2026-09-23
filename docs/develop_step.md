@@ -24,7 +24,7 @@
 | 首次权重 | 在同一 rollout 窗口最早安全快照点执行 target-only bootstrap；不等待下一次周期同步，也不对全部 replica 执行一次同步来代替 bootstrap |
 | 生命周期范围 | replica/manager 的 sleep、wake、reclaim、destroy，以及 server shutdown 只保留必要状态和接口；不开发完整摘流、续推、物理清理或 donor 恢复流程 |
 | 新组件 | 不引入 SlotSupervisor、ReplicaFactory、Coordinator、新资源池或业务数据类；协议使用普通字典 |
-| 首个同步后端 | 按最新版设计验收全量 NCCL 路径；训练端与接收端在 backend 初始化前配置 `rebuild_group=True`。其他后端、Ascend/NPU 不能据此自动算作通过 |
+| 首个同步后端 | 服务器为 Ascend/NPU 时使用插件 `multitask_hccl`（继承原生 HCCL，仅适配 communicator 销毁）；训练端与接收端在 backend 初始化前配置 `rebuild_group=True`。其他后端不能据此自动算作通过 |
 
 最新版中的创建示例使用 `M=4`，类定义给出默认值 `M=10`；实现按类定义提供配置默认值，示例通过显式配置覆盖。验收记录实际 M 和 PG 的 CPU/GPU 容量，不能仅看配置推断剩余资源。
 

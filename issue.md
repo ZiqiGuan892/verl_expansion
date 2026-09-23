@@ -203,3 +203,63 @@ required_samples = 2
 - 输出 `Training completed or interrupted`，没有 `AssertionError` 或 `Traceback`。
 
 本问题的训练 batch 修复不修改原生 verl 的 batch 平衡逻辑，只修改插件仓库的 D2 测试脚本。
+
+## 5. D3 target-only bootstrap 在 Ascend finalize 阶段失败
+
+### 现象
+
+执行：
+
+```bash
+D3_RUNTIME_SCENARIOS=split bash ../D3_test.sh
+```
+
+borrowed runtime 已创建，D3 bootstrap 也已进入通信域 finalize，但任务失败：
+
+```text
+ray.exceptions.RayTaskError(AttributeError): ... HCCLCheckpointEngine.finalize
+AttributeError: 'PyHcclCommunicator' object has no attribute 'destroyComm'
+```
+
+失败调用链为：
+
+```text
+MultiTaskCheckpointEngineManager.bootstrap_replica
+  -> execute_checkpoint_engine(["finalize"])
+  -> verl.checkpoint_engine.hccl_checkpoint_engine.HCCLCheckpointEngine.finalize
+  -> self.pyhccl.destroyComm(self.pyhccl.comm)
+```
+
+### 根因
+
+在当前 Ascend/vllm-ascend 组合中，`PyHcclCommunicator` 将底层 HCCL library wrapper
+保存在 `pyhccl.hccl`，销毁接口是 `pyhccl.hccl.hcclCommDestroy(pyhccl.comm)`；
+`destroyComm` 并不是 communicator 的方法。D3 设置 `rebuild_group=true` 后才会执行
+这个原生 finalize 销毁分支，因此 D2 的 runtime 创建测试没有暴露该问题。
+
+### 最小修复
+
+只在插件仓库新增：
+
+```text
+src/multi_task_scheduler/checkpoint/hccl_checkpoint_engine.py
+```
+
+`MultiTaskHCCLCheckpointEngine` 继承原生 `HCCLCheckpointEngine`，只重写 `finalize()`：
+
+1. 在拥有 communicator 时同步对应 NPU；
+2. 优先兼容旧版 `destroyComm`，否则调用当前 vllm-ascend 的
+   `pyhccl.hccl.hcclCommDestroy(pyhccl.comm)`；
+3. 销毁成功后清理 communicator、rank、world size 和 buffer；
+4. 销毁失败时保留原句柄和 buffer，并继续抛出原始异常。
+
+`D3_test.sh` 改用 `multitask_hccl`，并通过
+`checkpoint_engine.custom_backend_module` 让 actor、CE Worker、Trainer 使用同一个插件
+后端；原生 `nccl` registry 和外层 `verl` 文件均未修改。
+
+### 验证
+
+- 新增 HCCL finalize 单元测试，覆盖当前 API、旧 API、无 communicator、关闭重建、销毁失败和注册继承；
+- D3 CE/borrowed 目标测试结果：`37 passed`；
+- 目标服务器需要重新执行 `D3_RUNTIME_SCENARIOS=split bash ../D3_test.sh`，确认出现
+  `WEIGHTS_READY` 和 `FULL_SYNC_READY`。插件单元测试不能替代真实 HCCL 通信验证。

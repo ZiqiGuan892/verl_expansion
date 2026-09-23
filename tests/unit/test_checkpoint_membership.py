@@ -169,3 +169,22 @@ def test_unregister_removes_pending_and_confirmed_version():
     assert manager._find_replica_unlocked(6) is None
     assert 6 not in manager.pending_bootstrap
     assert 6 not in manager.last_synced_versions
+
+
+def test_finalize_failure_does_not_confirm_bootstrap_or_allow_full_sync():
+    manager, events, _ = _manager()
+    borrowed = _replica(4, "borrowed-worker")
+    target = _TargetGroup(events)
+    target.execute_checkpoint_engine = Mock(side_effect=RuntimeError("finalize failed"))
+    _RayWorkerGroup.target = target
+    asyncio.run(manager.register_replica(borrowed))
+
+    with pytest.raises(RuntimeError, match="finalize failed"):
+        asyncio.run(manager.bootstrap_replica(borrowed, snapshot_version=7))
+
+    assert manager.sync_state == "BLOCKED"
+    assert 4 in manager.pending_bootstrap
+    assert 4 not in manager.last_synced_versions
+    assert borrowed.serving_version is None
+    with pytest.raises(RuntimeError, match="BLOCKED"):
+        asyncio.run(manager.update_weights(global_steps=8))
