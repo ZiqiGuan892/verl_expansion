@@ -92,7 +92,7 @@ for scenario in $(printf '%s' "${D3_RUNTIME_SCENARIOS}" | tr ',' ' '); do
         "trainer.total_training_steps=${TOTAL_TRAINING_STEPS}" \
         "trainer.total_epochs=${TRAIN_TOTAL_EPOCHS}" \
         "rollout.total_rollout_steps=${TOTAL_ROLLOUT_STEPS}" \
-        "actor_rollout_ref.rollout.enable_sleep_mode=true" \
+        "+actor_rollout_ref.rollout.enable_sleep_mode=true" \
         "actor_rollout_ref.rollout.free_cache_engine=true" \
         "actor_rollout_ref.rollout.checkpoint_engine.backend=multitask_hccl" \
         "actor_rollout_ref.rollout.checkpoint_engine.custom_backend_module=multi_task_scheduler.checkpoint.hccl_checkpoint_engine" \

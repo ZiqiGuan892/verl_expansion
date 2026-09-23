@@ -324,3 +324,30 @@ D3_RUNTIME_SCENARIOS=basic bash ../D3_test.sh
 日志中应先出现 `RUNTIME_TEST_DONORS_SLEEPING`，再出现 borrowed 的
 `D3_BOOTSTRAP_RESULT`。若仍在 `Worker.init_device()` 报显存不足，应保留该 Worker 的
 完整日志，并检查 level-1 sleep 是否在目标 vllm-ascend 版本实际释放了设备显存。
+
+## 7. D3 脚本无法覆盖旧版配置中的 `enable_sleep_mode`
+
+### 现象
+
+服务器运行 D3 脚本时，在 Hydra 组合配置阶段失败：
+
+```text
+omegaconf.errors.ConfigAttributeError: Key 'enable_sleep_mode' is not in struct
+hydra.errors.ConfigCompositionException: Could not override
+'actor_rollout_ref.rollout.enable_sleep_mode'.
+To append to your config use +actor_rollout_ref.rollout.enable_sleep_mode=true
+```
+
+此时训练尚未创建 Ray Actor，也没有进入 vLLM 或 borrowed replica 创建流程。
+
+### 根因与修复
+
+服务器使用的 verl 配置 schema 没有声明 `enable_sleep_mode`，而 D3/D2 脚本使用普通
+覆盖语法，Hydra 的 struct 校验因此拒绝该字段。将两个脚本中的 override 改为：
+
+```text
++actor_rollout_ref.rollout.enable_sleep_mode=true
+```
+
+这样会在旧 schema 中追加该测试字段；已有的 `free_cache_engine` 字段继续使用普通覆盖。
+MSC 的 `Profile "" not found` 日志是可选存储配置探测告警，不是本次 Hydra 失败的原因。
