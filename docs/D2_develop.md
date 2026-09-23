@@ -285,11 +285,37 @@ manager 接口。每个场景至少保存：
 接流归 D3/D4；只确认 runtime 能启动、实际设备正确、endpoint 已建立且失败
 边界可定位。
 
+### 5.4 D2 服务器联调问题：PlacementGroup 名称读取
+
+首次在服务器运行 `D2_runtime_test.sh` 的 `split` 场景时，native replica
+和 native HTTP server 都已启动，但测试在构造 spec 前失败：
+
+```text
+RuntimeError: native placement group has no globally discoverable name
+  ... llm_server_manager.py, _snapshot_native_claims
+```
+
+根因不是 PG 丢失。Ray 的 `PlacementGroup` 公共句柄只保证 `id`、bundle
+查询等接口，不保证 `.name` 或 `._name` 属性；原实现把这两个属性当成名称来源，
+因此把正常的 native PG 误判为不可查找。native PG 是用名字创建的，但名称存储在
+Ray 的 placement-group table 中。
+
+修复只修改插件 manager：对每个 native PG 调用
+`ray.util.placement_group_table(placement_group)`，读取表中的 `name`，再把
+`pg.id.hex()`、名称和 bundle index 写入测试 claims。borrowed 创建仍通过
+`ray.util.get_placement_group(pg_name)` 查找原 PG，不创建或删除 PG。若表中确实
+没有名称，仍立即失败并保留明确错误；这表示 donor PG 没有满足跨任务借用所需的
+全局命名约束。
+
+新增单元覆盖无 `.name` 的真实句柄形状、单 PG/多 PG 名称映射以及 Ray table
+缺少名称的失败路径。修复后的本地结果为 `27 passed`；真实 NPU/vLLM 场景仍需
+重新运行 `D2_runtime_test.sh`。
+
 ## 6. 当前验证记录与限制
 
 - 代码修改范围仅在 `verl-multi-task` 仓库；外层原生 `verl` 未修改。
 - `uv run ... py_compile` 已通过。
-- D2 相关隔离测试、D1 契约测试和 wiring 测试已通过：`22 passed`。服务器上的 native 适配组合测试已达到 `33 passed`；这些测试仍不等于 borrowed engine 已启动。
+- D2 相关隔离测试、D1 契约测试和 wiring 测试已通过：`27 passed`。服务器上的 native 适配组合测试已达到 `33 passed`；这些测试仍不等于 borrowed engine 已启动。
 - 全量 `tests/unit` 在当前环境收集失败，因为本地虚拟环境没有 `omegaconf`；原生适配测试收集还需要 `ray`。这两项不能记录为通过，应在服务器的完整 verl 环境中执行。
 - D2 代码依赖与实际运行环境匹配的 verl/Ray/vLLM/vLLM-Ascend 版本。导入路径、vLLM engine 启动失败和设备标识格式不一致，都应先记录为环境/兼容性问题，不应通过修改 donor 资源归属来规避。
 - `D2_runtime_test.sh` 是进入 D3 前的真实创建验收入口；只有保留 `RUNTIME_READY`、实际 Actor/device/PG 映射和失败清理证据后，D2 才能进入 D3 的 CE 通信域和 bootstrap 开发。

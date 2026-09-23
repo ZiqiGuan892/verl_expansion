@@ -452,6 +452,19 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         if len(workers) != int(replica.world_size) or len(placement_groups) != int(replica.nnodes):
             raise RuntimeError("native replica topology is incomplete for D2 claim snapshot")
 
+        # PlacementGroup is an ID/bundle handle, not a holder of its registered
+        # name. Query Ray's metadata once per PG, not once per worker/bundle.
+        pg_names = {}
+        for placement_group in placement_groups:
+            pg_id = placement_group.id.hex()
+            pg_info = ray.util.placement_group_table(placement_group)
+            pg_name = (pg_info or {}).get("name")
+            if not isinstance(pg_name, str) or not pg_name:
+                raise RuntimeError(
+                    f"native placement group {pg_id} has no registered name in Ray placement_group_table"
+                )
+            pg_names[pg_id] = pg_name
+
         def inspect_worker(_worker):
             import os
 
@@ -484,12 +497,8 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             node_rank = node_rank_by_id.setdefault(node_id, len(node_rank_by_id))
             local_rank = local_rank_by_node.get(node_id, 0)
             local_rank_by_node[node_id] = local_rank + 1
-            pg_name = getattr(placement_group, "name", None) or getattr(placement_group, "_name", None)
-            if not isinstance(pg_name, str) or not pg_name:
-                raise RuntimeError("native placement group has no globally discoverable name")
-            pg_id_obj = getattr(placement_group, "id", None)
-            pg_id_hex = getattr(pg_id_obj, "hex", None)
-            pg_id = pg_id_hex() if callable(pg_id_hex) else str(pg_id_hex or pg_id_obj)
+            pg_id = placement_group.id.hex()
+            pg_name = pg_names[pg_id]
             claims.append(
                 {
                     "claim_id": f"d2-claim-{replica.replica_rank}-{rank}",

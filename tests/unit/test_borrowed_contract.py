@@ -13,7 +13,7 @@ import math
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 
@@ -76,6 +76,7 @@ def _manager_class():
         "MultiTaskLLMServerManager",
         _ManagerParent,
         ray=SimpleNamespace(remote=Mock()),
+        get_device_name=lambda: "npu",
         MultiTaskvLLMReplica=_FakeBorrowedReplica,
         MultiTaskGlobalRequestLoadBalancer=object,
     )
@@ -229,6 +230,56 @@ def test_rank_is_monotonic_and_retire_requires_the_owner():
     assert second["replica_rank"] == 1
     with pytest.raises(KeyError):
         asyncio.run(manager.retire_replica_rank(second["replica_rank"], "wrong-owner"))
+
+
+@pytest.mark.parametrize("node_count", [1, 2])
+def test_native_claim_snapshot_reads_names_from_ray_table(node_count):
+    """Use PG handles without name attributes, as in the real Ray API."""
+    manager = _manager()
+    groups = [SimpleNamespace(id=SimpleNamespace(hex=Mock(return_value=f"pg-{node}")))
+              for node in range(node_count)]
+    pg_table = Mock(side_effect=lambda pg: {"name": f"native-{pg.id.hex()}"})
+    manager._snapshot_native_claims.__globals__["ray"].util = SimpleNamespace(placement_group_table=pg_table)
+    workers = [
+        SimpleNamespace(__ray_call__=SimpleNamespace(remote=AsyncMock(return_value={
+            "node_id": f"node-{rank // 2}", "accelerator_id": str(4 + rank % 2),
+        })))
+        for rank in range(node_count * 2)
+    ]
+    native = SimpleNamespace(
+        resource_pool=SimpleNamespace(get_placement_groups=Mock(return_value=groups)),
+        workers=workers, world_size=len(workers), nnodes=node_count,
+        gpus_per_replica_node=2, replica_rank=0,
+    )
+
+    claims = asyncio.run(manager._snapshot_native_claims(native, "donor-task"))
+
+    assert pg_table.call_args_list == [call(pg) for pg in groups]
+    assert [(c["pg_id"], c["pg_name"], c["bundle_index"]) for c in claims] == [
+        (f"pg-{rank // 2}", f"native-pg-{rank // 2}", rank % 2) for rank in range(len(workers))
+    ]
+    assert [c["accelerator_id"] for c in claims] == [str(4 + rank % 2) for rank in range(len(workers))]
+    assert [c["node_id"] for c in claims] == [f"node-{rank // 2}" for rank in range(len(workers))]
+
+
+@pytest.mark.parametrize("pg_info", [None, {}, {"name": ""}])
+def test_native_claim_snapshot_rejects_missing_registered_name(pg_info):
+    manager = _manager()
+    pg = SimpleNamespace(id=SimpleNamespace(hex=lambda: "unnamed-pg-id"))
+    manager._snapshot_native_claims.__globals__["ray"].util = SimpleNamespace(
+        placement_group_table=Mock(return_value=pg_info)
+    )
+    remote = AsyncMock()
+    native = SimpleNamespace(
+        resource_pool=SimpleNamespace(get_placement_groups=Mock(return_value=[pg])),
+        workers=[SimpleNamespace(__ray_call__=SimpleNamespace(remote=remote))],
+        world_size=1, nnodes=1, gpus_per_replica_node=1, replica_rank=0,
+    )
+
+    with pytest.raises(RuntimeError, match="unnamed-pg-id has no registered name"):
+        asyncio.run(manager._snapshot_native_claims(native, "donor-task"))
+    remote.assert_not_called()
+    assert not manager.borrowed_operations
 
 
 class _ReplicaParent:
