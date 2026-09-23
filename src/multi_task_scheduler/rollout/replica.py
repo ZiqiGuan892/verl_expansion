@@ -269,6 +269,18 @@ class MultiTaskvLLMReplica(vLLMReplica):
     async def _cleanup_runtime(self) -> dict:
         """Request termination of owned actors, never claim a lease is released."""
         result = {"kill_requested": [], "errors": [], "release_confirmed": False}
+        # Ask each HTTP actor to stop its vLLM EngineCore first.  ``ray.kill``
+        # is still required, but it is asynchronous and can leave the
+        # multiprocessing child alive long enough to poison the next borrowed
+        # launch on the same physical devices.
+        for server in list(self.servers):
+            try:
+                shutdown = getattr(server, "shutdown_engine", None)
+                remote = getattr(shutdown, "remote", None)
+                if callable(remote):
+                    await remote()
+            except Exception as exc:
+                result["errors"].append(f"server shutdown: {exc}")
         for handle in list(self.servers) + list(self.workers):
             try:
                 ray.kill(handle, no_restart=True)

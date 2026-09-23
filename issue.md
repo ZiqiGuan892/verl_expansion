@@ -263,3 +263,60 @@ src/multi_task_scheduler/checkpoint/hccl_checkpoint_engine.py
 - D3 CE/borrowed 目标测试结果：`37 passed`；
 - 目标服务器需要重新执行 `D3_RUNTIME_SCENARIOS=split bash ../D3_test.sh`，确认出现
   `WEIGHTS_READY` 和 `FULL_SYNC_READY`。插件单元测试不能替代真实 HCCL 通信验证。
+
+## 6. D3 重复运行时 EngineCore 子进程残留
+
+### 现象
+
+在服务器执行 D3 `split` 场景时，borrowed HTTP server 在 vLLM EngineCore 启动阶段失败：
+
+```text
+Exception: WorkerProc initialization failed due to an exception in a background process.
+RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
+ResourceWarning: subprocess ... is still running
+```
+
+附件日志从 vLLM 的通用包装异常开始，未包含 `core.py:1195` 之前实际的
+`WorkerProc`/`torch_npu`/`ACL`/`HCCL`/`OOM` 行，因此不能仅凭该附件断言底层是显存不足还是设备通信初始化失败。
+但日志明确表明 EngineCore 子进程在任务失败时仍未退出。
+
+### 根因
+
+D2/D3 的测试清理原先只对 HTTP server 和 CE Worker 调用 `ray.kill`。Ray actor 被杀后，
+vLLM V1 的 `AsyncLLM` EngineCore 是独立的 multiprocessing 子进程，可能短时间继续持有
+同一 NPU 的显存、IPC socket 或设备上下文。下一次测试又在 donor 的物理 NPU 上启动 borrowed
+engine 时，就可能在 WorkerProc 初始化阶段失败。Ray 的 fractional `num_gpus` 只参与调度，
+不能隔离显存或强制回收该子进程。
+
+### 最小修复
+
+只修改插件仓库：
+
+```text
+src/multi_task_scheduler/rollout/http_server.py
+src/multi_task_scheduler/rollout/replica.py
+```
+
+`MultiTaskvLLMHttpServer.shutdown_engine()` 在清理前优先调用当前 vLLM 的
+`AsyncLLM.shutdown()`；若目标版本只提供 `shutdown_background_loop()` 则兼容调用。
+如果 EngineCore 在初始化异常时尚未写入 `self.engine`，方法只终止当前 HTTP actor 的
+递归子进程，并记录 PID，不触碰其他 Ray actor 或任务。`MultiTaskvLLMReplica._cleanup_runtime()`
+现在先逐个调用该方法，再执行原有 `ray.kill`；清理失败会写入 receipt 的 `errors`，不会覆盖创建失败的原始异常。
+
+该修复解决的是已确认的子进程残留问题；如果清理后仍失败，必须从完整日志中取得通用包装异常
+之前的根因行，再针对 OOM、ACL 或 HCCL 做单独配置调整，不能把版本混用或显存不足直接归因于
+当前插件代码。
+
+### 验证
+
+- 新增单元测试覆盖 `AsyncLLM.shutdown()` 优先调用并清空 engine 句柄；目标插件测试结果：`34 passed`。
+- 服务器上先停止上一轮 Ray 任务，再执行：
+
+```bash
+D3_RUNTIME_SCENARIOS=split bash ../D3_test.sh
+```
+
+- 连续执行两次时，每次日志都应出现 `D3_BOOTSTRAP_RESULT`、`WEIGHTS_READY`、
+  `D3_NORMAL_SYNC_RESULT`、`FULL_SYNC_READY`，且不再出现 `ResourceWarning: subprocess ... is still running`。
+- 若第一次失败，保留该次日志并检查 `EngineCore` 通用包装异常之前的子进程堆栈；不要在未确认根因时修改
+  TP、显存比例或 vLLM 源码版本。
