@@ -4,7 +4,7 @@
 
 本版取代旧计划的 D00—D14。D0 与历史 D00 是同一步；交接文件中的“D01 尚未获准开始”，对应本版 D1 的进入门禁。旧计划中的全量生命周期实现不再是本轮交付目标。
 
-**当前状态：D0 已由用户确认验收通过；D1 已由用户确认验收通过；D2 代码开发完成，详细记录在 [D2_develop.md](D2_develop.md)，等待真实 Ray/GPU 验收。D3—D4 未开始。**
+**当前状态：D0 已由用户确认验收通过；D1 已由用户确认验收通过；D2 代码和真实 main_ppo 测试入口已完成，详细记录在 [D2_develop.md](D2_develop.md)，等待服务器运行 `D2_runtime_test.sh` 留存 runtime 证据。D3—D4 未开始。**
 
 ## 1. 本轮范围与实现边界
 
@@ -36,7 +36,7 @@
 | --- | --- | --- | --- |
 | D0：运行基线 | 原生与插件路径均可启动的基线 | 已有测试配置、fixture、开发日志 | 同一原生配置在 profile 关闭/开启时均完成初始化、生成和参数同步 |
 | D1：创建契约与本地管理 | spec 校验、身份分配、幂等记录和预留接口 | `llm_server_manager.py`、`rollout/replica.py` | 非法输入无副作用；重复请求不产生重复 rank/runtime；返回值不泄漏 handles |
-| D2：borrowed runtime 创建 | 显式 PG/bundle → CE Workers → HTTP server/engine，达到 RUNTIME_READY | `rollout/replica.py`、manager、配置接线 | 真实跨 job 放置正确；拆分、拼接、碎片化、多 claim 可验证；borrower 不创建或删除 donor PG |
+| D2：borrowed runtime 创建 | 显式 PG/bundle → CE Workers → HTTP server/engine，达到 RUNTIME_READY；CE 注册、bootstrap、LB 接流留空 | `rollout/replica.py`、manager、Rollouter 测试 hook、D2 runtime 脚本 | 真实放置正确；拆分、拼接、碎片化、多 claim 和失败清理可验证；borrower 不创建或删除 donor PG |
 | D3：CE 注册与首次同步 | target-only bootstrap、版本确认、后续全成员同步与成员注销 | `checkpoint_engine_manager.py`、`trainer.py` | 新 replica 真正加载 borrower 权重；已有服务不被 bootstrap 中断；通信域完成 finalize |
 | D4：任务入口与接流 | TaskRunner 编排创建、Rollouter 薄转发、LB READY 和最终回执 | `task_runner.py`、`rollouter.py`、manager、`load_balancer.py` | 训练期间可执行创建；新 replica 在确认权重后收到并完成请求；GS 只接收元数据 |
 
@@ -81,7 +81,7 @@
 
 ### D2：按 claims 创建独立 borrowed runtime
 
-**本阶段实现记录：** [D2_develop.md](D2_develop.md)。当前已完成代码和隔离单元测试；真实 Ray/GPU 矩阵待在服务器执行。以下表格保留阶段级开发与验收门禁，具体方法、字段、时序和失败语义见 D2 日志。
+**本阶段实现记录：** [D2_develop.md](D2_develop.md)。当前已完成创建代码、隔离单元测试和 main_ppo 真实测试入口；真实 Ray/GPU 矩阵由 `D2_runtime_test.sh` 执行。以下表格保留阶段级开发与验收门禁，具体方法、字段、时序和失败语义见 D2 日志。
 
 **目标：** 由 manager 调用真实 `init_from_lease(spec)`，得到包含独立 CE Workers、HTTP server 和 engine 的 RUNTIME_READY replica。此时不向 LB 发布新 server。
 
@@ -107,9 +107,9 @@
 
 多 CE Worker 的 fractional 资源分配只证明 Ray 放置能力，不证明显存隔离，也不能推出同一 vLLM 并行组的多个 rank 可重复使用一张物理卡。共卡 engine 必须另有足够显存、独立端口/IPC，并以真实运行结果确认；不能把同卡多个 CE Worker 当成多张物理卡。
 
-**验收文件：** 已新增 `tests/unit/test_borrowed_runtime.py`，扩充 D1 校验用例及已有 native 适配测试；真实 GPU/Ray 验收仍需在服务器补充。测试使用预先授权、运行空间已释放的 donor PG；不能把仍在运行的 donor engine 部分 rank 直接拿走。
+**验收文件：** 已新增 `tests/unit/test_borrowed_runtime.py` 和 `D2_runtime_test.sh`，扩充 D1 校验用例及已有 native 适配测试。真实脚本使用 native 初始化后读取的 donor PG；不能把仍在运行的 donor engine 部分 rank 直接拿走。
 
-**通过条件：** 对矩阵分别记录实际 Actor/device/PG 映射和成功或失败证据；缺少跨 job、多卡或跨机环境时，相关能力仍为待验收，不能据此进入依赖这些结论的下一阶段。创建失败只要求可定位、不可接流和释放状态真实；完整自动回收不属于 D2。用户确认后进入 D3。
+**通过条件：** 对矩阵分别记录实际 Actor/device/PG 映射和成功或失败证据；`D2_runtime_test.sh` 至少完成一个成功场景和一个失败场景；CE 注册、bootstrap、LB 接流不属于本阶段。创建失败只要求可定位、不可接流和释放状态真实；完整自动回收不属于 D2。用户确认后进入 D3。
 
 ### D3：CE 成员管理、target-only bootstrap 与通信域验证
 
@@ -162,7 +162,7 @@
 | R：CPU Ray | 跨进程调用、管理入口并发、句柄边界 | GPU 份额、显存和通信域 |
 | G：真实 GPU 运行 | PG/bundle 放置、engine、权重同步和生成 | 未执行的多卡、跨节点或 NPU 场景 |
 
-D2—D4 表内新增测试路径仍是**待开发的验收文件**；D1 的 `tests/unit/test_borrowed_contract.py` 已创建但尚未在本机执行成功。已有 `tests/gpu/` 和 marker 来自 D0。显式选择的真实验收缺配置或硬件时，记录环境阻塞，不能以 skip 或 mocked 结果算作通过。
+D3—D4 表内新增测试路径仍是**待开发的验收文件**；D2 已有 `D2_runtime_test.sh`，但必须在目标服务器执行后才能形成真实 runtime 证据。已有 `tests/gpu/` 和 marker 来自 D0。显式选择的真实验收缺配置或硬件时，记录环境阻塞，不能以 skip 或 mocked 结果算作通过。
 
 ### 命令约定
 

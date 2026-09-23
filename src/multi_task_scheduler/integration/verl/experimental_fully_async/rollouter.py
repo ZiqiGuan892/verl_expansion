@@ -36,9 +36,35 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
             worker_group=self.get_hybrid_worker_group(),
             group_scheduler=self.group_scheduler,
         )
+        await self._maybe_run_d2_runtime_smoke()
         self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
             config=self.config,
             llm_client=self.llm_server_manager.get_client(client_cls=FullyAsyncLLMServerClient),
             reward_loop_worker_handles=reward_loop_worker_handles,
             teacher_client=self.teacher_model_manager.get_client() if self.teacher_model_manager else None,
         )
+
+    async def _maybe_run_d2_runtime_smoke(self) -> None:
+        """Run an opt-in D2 creation scenario after native replicas exist.
+
+        The hook is disabled unless the launcher adds
+        ``+multitask.d2_runtime_test.enabled=true``.  It deliberately stops at
+        ``RUNTIME_READY``: CE registration, parameter bootstrap and LB
+        publication belong to later stages and are not called here.
+        """
+        config_get = getattr(self.config, "get", None)
+        multitask_config = (
+            config_get("multitask", {})
+            if callable(config_get)
+            else getattr(self.config, "multitask", {})
+        )
+        test_config = multitask_config.get("d2_runtime_test", {}) if multitask_config is not None else {}
+        if not bool(test_config.get("enabled", False)):
+            return
+        scenario = str(test_config.get("scenario", "split"))
+        cleanup_after_test = bool(test_config.get("cleanup_after_test", True))
+        result = await self.llm_server_manager.run_d2_runtime_smoke(
+            scenario=scenario,
+            cleanup_after_test=cleanup_after_test,
+        )
+        print(f"[D2 RUNTIME] scenario={scenario} status={result.get('status')}")

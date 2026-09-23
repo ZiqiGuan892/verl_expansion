@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import json
 import math
 import time
 
@@ -9,6 +10,7 @@ import ray
 
 from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncLLMServerManager
 from verl.workers.rollout.router import DEFAULT_ROUTING_CACHE_SIZE
+from verl.utils.device import get_device_name
 
 from multi_task_scheduler.rollout.load_balancer import MultiTaskGlobalRequestLoadBalancer
 from multi_task_scheduler.rollout.replica import MultiTaskvLLMReplica
@@ -432,6 +434,196 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 "error": None,
             }
             return self._receipt(record)
+
+    async def _snapshot_native_claims(self, replica, donor_task_id: str) -> list[dict]:
+        """Build physical claims from one initialized native replica for D2 smoke tests.
+
+        This helper is deliberately local to the test hook.  Production claims
+        still come from GS; the helper only avoids inventing PG or device IDs in
+        a real Ray validation run.
+        """
+        resource_pool = getattr(replica, "resource_pool", None)
+        workers = list(getattr(replica, "workers", []))
+        if resource_pool is None or not workers:
+            raise RuntimeError("native replica has no initialized resource pool or workers")
+
+        placement_groups = resource_pool.get_placement_groups(device_name=get_device_name())
+        local_world_size = int(replica.gpus_per_replica_node)
+        if len(workers) != int(replica.world_size) or len(placement_groups) != int(replica.nnodes):
+            raise RuntimeError("native replica topology is incomplete for D2 claim snapshot")
+
+        def inspect_worker(_worker):
+            import os
+
+            import ray
+            from verl.utils.device import get_resource_name
+
+            context = ray.get_runtime_context()
+            resource_ids = context.get_accelerator_ids().get(get_resource_name(), [])
+            if not resource_ids:
+                raise RuntimeError("native worker exposes no accelerator id")
+            return {
+                "node_id": context.get_node_id(),
+                "accelerator_id": str(resource_ids[0]),
+                "actor_id": str(context.get_actor_id()),
+                "pid": os.getpid(),
+            }
+
+        worker_infos = await asyncio.gather(*[worker.__ray_call__.remote(inspect_worker) for worker in workers])
+        node_rank_by_id: dict[str, int] = {}
+        local_rank_by_node: dict[str, int] = {}
+        claims = []
+        expanded_placement_groups = [
+            placement_group for placement_group in placement_groups for _ in range(local_world_size)
+        ]
+        for rank, (worker_info, placement_group) in enumerate(zip(worker_infos, expanded_placement_groups, strict=True)):
+            # Native RayWorkerGroup creates local ranks consecutively inside
+            # each PG; the placement group list therefore repeats once per
+            # local worker when expanded by local_world_size.
+            node_id = worker_info["node_id"]
+            node_rank = node_rank_by_id.setdefault(node_id, len(node_rank_by_id))
+            local_rank = local_rank_by_node.get(node_id, 0)
+            local_rank_by_node[node_id] = local_rank + 1
+            pg_name = getattr(placement_group, "name", None) or getattr(placement_group, "_name", None)
+            if not isinstance(pg_name, str) or not pg_name:
+                raise RuntimeError("native placement group has no globally discoverable name")
+            pg_id_obj = getattr(placement_group, "id", None)
+            pg_id_hex = getattr(pg_id_obj, "hex", None)
+            pg_id = pg_id_hex() if callable(pg_id_hex) else str(pg_id_hex or pg_id_obj)
+            claims.append(
+                {
+                    "claim_id": f"d2-claim-{replica.replica_rank}-{rank}",
+                    "lease_id": f"d2-source-lease-{replica.replica_rank}",
+                    "donor_task_id": donor_task_id,
+                    "donor_replica_rank": int(replica.replica_rank),
+                    "pg_id": pg_id,
+                    "pg_name": pg_name,
+                    "bundle_index": rank % local_world_size,
+                    "node_id": node_id,
+                    "gpu_uuid": worker_info["accelerator_id"],
+                    "accelerator_id": worker_info["accelerator_id"],
+                    "local_gpu_index": local_rank,
+                    "node_rank": node_rank,
+                    "local_rank": local_rank,
+                    "gpu_fraction": 0.5,
+                    "cpu_request": 1.0,
+                }
+            )
+        return claims
+
+    @staticmethod
+    def _reindex_test_claims(claims: list[dict]) -> list[dict]:
+        """Assign borrower-local rank and uniform node/local ranks."""
+        node_order: dict[str, int] = {}
+        for claim in claims:
+            node_order.setdefault(claim["node_id"], len(node_order))
+        ordered = sorted(claims, key=lambda item: (node_order[item["node_id"]], item["local_rank"]))
+        local_ranks: dict[str, int] = {}
+        for rank, claim in enumerate(ordered):
+            node_id = claim["node_id"]
+            local_rank = local_ranks.get(node_id, 0)
+            local_ranks[node_id] = local_rank + 1
+            claim["rank"] = rank
+            claim["node_rank"] = node_order[node_id]
+            claim["local_rank"] = local_rank
+            claim["claim_id"] = f"{claim['claim_id']}-borrower-{rank}"
+        return ordered
+
+    async def _build_d2_test_spec(self, scenario: str) -> tuple[dict, bool]:
+        """Construct one real-placement spec and report whether failure is expected."""
+        native_replicas = list(getattr(self, "rollout_replicas", []))
+        if not native_replicas:
+            raise RuntimeError("D2 test requires at least one initialized native replica")
+        donor_task_id = "d2-local-donor-task"
+        snapshots = await asyncio.gather(
+            *[self._snapshot_native_claims(replica, donor_task_id) for replica in native_replicas]
+        )
+        source_claims = snapshots[0]
+        expected_failure = scenario in {"missing_pg", "duplicate_device", "expired"}
+
+        if scenario == "basic":
+            selected = source_claims
+        elif scenario == "split":
+            if len(source_claims) < 2:
+                raise RuntimeError("split scenario needs a native replica with at least two workers")
+            selected = source_claims[: len(source_claims) // 2]
+        elif scenario == "fragmented":
+            if len(source_claims) < 3:
+                raise RuntimeError("fragmented scenario needs at least three native workers")
+            selected = source_claims[::2]
+        elif scenario == "cross_pg":
+            if len(snapshots) < 2:
+                raise RuntimeError("cross_pg scenario needs at least two native replicas/PGs")
+            selected = [snapshots[0][0], snapshots[1][0]]
+        elif scenario in {"missing_pg", "duplicate_device", "expired"}:
+            if len(source_claims) < 2:
+                raise RuntimeError(f"{scenario} scenario needs at least two native workers")
+            selected = source_claims[:2]
+        else:
+            raise ValueError(f"unknown D2 runtime scenario: {scenario}")
+
+        selected = copy.deepcopy(selected)
+        if scenario == "missing_pg":
+            selected[0]["pg_name"] = f"missing-d2-pg-{time.time_ns()}"
+        elif scenario == "duplicate_device":
+            selected[1]["node_id"] = selected[0]["node_id"]
+            selected[1]["gpu_uuid"] = selected[0]["gpu_uuid"]
+            selected[1]["accelerator_id"] = selected[0]["accelerator_id"]
+        selected = self._reindex_test_claims(selected)
+        world_size = len(selected)
+        spec = {
+            "operation_id": f"d2-smoke-{scenario}-{time.time_ns()}",
+            "lease_id": f"d2-borrower-lease-{scenario}-{time.time_ns()}",
+            "lease_ids": list(dict.fromkeys(claim["lease_id"] for claim in selected)),
+            "borrower_task_id": "d2-local-borrower-task",
+            "borrower_replica_id": f"d2-borrower-{scenario}",
+            "claims": selected,
+            "world_size": world_size,
+            "max_colocate_count": 2,
+            "expires_at": time.time() + 600.0,
+            "placement_epoch": 1,
+            "parallelism": {
+                "tensor_model_parallel_size": world_size,
+                "data_parallel_size": 1,
+                "pipeline_model_parallel_size": 1,
+            },
+            "creation_timeout_s": 600.0,
+        }
+        if scenario == "expired":
+            spec["expires_at"] = time.time() - 1.0
+        return spec, expected_failure
+
+    async def run_d2_runtime_smoke(self, scenario: str, cleanup_after_test: bool = True) -> dict:
+        """Run one real-placement D2 create scenario; CE/LB remain untouched."""
+        spec, expected_failure = await self._build_d2_test_spec(scenario)
+        try:
+            receipt = await self.create_borrowed_replica(spec)
+        except Exception as exc:
+            if not expected_failure:
+                raise
+            result = {"scenario": scenario, "status": "EXPECTED_FAILURE", "error": str(exc)}
+            print(f"D2_RUNTIME_RESULT {json.dumps(result, sort_keys=True)}")
+            return result
+
+        state = receipt.get("state")
+        if expected_failure:
+            if state not in {"FAILED", "CREATING"}:
+                raise RuntimeError(f"D2 scenario {scenario} unexpectedly returned {state}: {receipt}")
+            result = {"scenario": scenario, "status": "EXPECTED_FAILURE", "receipt": receipt}
+            print(f"D2_RUNTIME_RESULT {json.dumps(result, sort_keys=True, default=str)}")
+            return result
+        if state != "RUNTIME_READY":
+            raise RuntimeError(f"D2 scenario {scenario} did not reach RUNTIME_READY: {receipt}")
+
+        cleanup = None
+        if cleanup_after_test:
+            record = self.borrowed_operations.get(spec["lease_id"])
+            replica = record.get("replica") if record else None
+            if replica is not None:
+                cleanup = await replica._cleanup_runtime()
+        result = {"scenario": scenario, "status": "PASS", "receipt": receipt, "cleanup": cleanup}
+        print(f"D2_RUNTIME_RESULT {json.dumps(result, sort_keys=True, default=str)}")
+        return result
 
     async def reclaim_replica(self, lease_id: str) -> dict:
         """Reserve the reclaim contract without performing lifecycle cleanup."""

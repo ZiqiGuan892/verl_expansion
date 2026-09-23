@@ -15,7 +15,7 @@ GS 下发 placement claims
   -> 返回 RUNTIME_READY
 ```
 
-本阶段没有实现 CE 参数同步、LB 接流、sleep、wake、reclaim 或 destroy 的完整编排。创建成功只表示 borrower 的 Worker、HTTP server 和 engine 已经启动并且实际落点通过校验；它不会自动加入全局 LB，也不会被加入 donor 的 Worker 或通信域。
+本阶段没有实现 CE 注册、参数 bootstrap、LB 接流、sleep、wake、reclaim 或 destroy 的完整编排。创建成功只表示 borrower 的 Worker、HTTP server 和 engine 已经启动并且实际落点通过校验；它不会自动加入全局 LB，也不会被加入 donor 的 Worker 或通信域。
 
 D2 选择“复用 donor PG 的指定 bundle、创建新的 actor”的方案。borrower 不创建 PG，也不复用 donor CE Worker。这样支持非连续 bundle、多个 PG 拼接以及与 donor 不同的 world size，同时保持 donor actor 的所有权不变。
 
@@ -81,14 +81,38 @@ server 创建没有另写一套 vLLM 启动器，而是先按 borrower 的 node/
 
 manager 仍只拥有本任务的 `borrowed_operations`。全局 lease、bundle 是否可借、跨任务冲突和归还授权由 GS 决定，manager 不维护第二份全局表。
 
+为在 GS 尚未提供真实命令前执行 D2 的 Ray/GPU 验收，manager 增加了三个测试辅助方法：
+
+| 方法 | 作用 |
+| --- | --- |
+| `_snapshot_native_claims(replica, donor_task_id)` | 从已初始化 native replica 的 resource pool、Worker runtime context 和 PlacementGroup 读取真实 PG 名称、bundle、node、accelerator ID，生成可用于本次测试的 claims；不向生产 GS 协议写入状态 |
+| `_build_d2_test_spec(scenario)` | 以真实 claims 为基础生成 `basic`、`split`、`fragmented`、`cross_pg` 和预期失败场景；只虚构 lease/operation 等逻辑字段，不虚构物理资源字段 |
+| `run_d2_runtime_smoke(scenario, cleanup_after_test=True)` | 调用正式 `create_borrowed_replica()`，校验 `RUNTIME_READY` 或预期失败，并在成功场景结束后只清理本次 borrowed Actor；不调用 CE、bootstrap 或 LB |
+
+这些方法只由 Rollouter 的显式 D2 测试开关调用，正常 profile 不会执行。测试成功后的 `RUNTIME_READY` 是 runtime-ready，不是 serving-ready；因为参数版本尚未 bootstrap，测试不会把新 server 加入 LB。
+
 ### 2.3 测试文件
 
 | 文件 | 内容 |
 | --- | --- |
 | `tests/unit/test_borrowed_contract.py` | 将 D1 的创建断言更新为 fake runtime receipt；仍验证 idempotency、rank 分配和预留 reclaim 行为 |
 | `tests/unit/test_borrowed_runtime.py` | 不启动 Ray/vLLM，使用真实扩展类方法验证 claims 的 node/rank 分组、交错布局拒绝、异构 world size 的 config 隔离，以及不可见 named PG 的明确失败 |
+| `D2_runtime_test.sh` | 从 `multi_task_run.sh` 进入 `fully_async_main`/`main_ppo`，按场景启用测试 hook；每个场景独立运行并检查 `D2_RUNTIME_RESULT` |
 
-单元测试不宣称 GPU runtime 成功。真实 actor、engine、非连续 bundle 和跨 PG 场景必须由服务器上的 Ray/GPU 验收执行。
+单元测试不宣称 GPU runtime 成功。真实 actor、engine、非连续 bundle 和跨 PG 场景由 `D2_runtime_test.sh` 在服务器上的 Ray/GPU 环境执行。
+
+### 2.4 主入口测试 hook 的边界
+
+`MultiTaskFullyAsyncRollouter._maybe_run_d2_runtime_smoke()` 位于 native
+replica 初始化和 AgentLoop manager 创建之间，只有配置中显式出现
+`+multitask.d2_runtime_test.enabled=true` 时才执行。它先读取当前 manager
+已经创建的 native replicas，再调用正式 borrowed 创建接口；没有另写一套
+Worker 或 HTTP server 创建器。成功场景测试完成后默认调用 replica 的失败清理
+路径释放本次 borrowed Actor，避免 D2 尚未实现 reclaim 时影响后续训练。
+
+该 hook 不改变以下正常路径：native replica 初始化、native LB、Trainer 参数
+同步、AgentLoop 请求处理。它也不持有 GS 句柄，不代表 D4 的 TaskRunner 命令
+编排；GS 创建 spec 后续接入时复用同一个 `create_borrowed_replica(spec)`。
 
 ## 3. 完整创建流程与组件调用关系
 
@@ -183,6 +207,40 @@ Ray/vLLM 的 D2 隔离测试，可使用：
 D2_INCLUDE_NATIVE=0 bash ../D2_test.sh
 ```
 
+### 5.2 真实 main_ppo borrowed 创建测试
+
+从服务器原生 `verl` 目录执行：
+
+```bash
+bash ../D2_runtime_test.sh
+```
+
+默认按顺序启动三个独立的 main_ppo 进程：
+
+| 场景 | 目的 | 预期 |
+| --- | --- | --- |
+| `split` | 一个 native replica 的 claims 拆出 `world_size=2` | borrowed Worker、HTTP server、engine 启动并返回 `RUNTIME_READY` |
+| `fragmented` | 使用同一 PG 的非连续 bundle | 物理落点逐 claim 匹配并返回 `RUNTIME_READY` |
+| `missing_pg` | 替换一个不存在的 PG 名称 | 返回预期失败，donor PG 不被删除 |
+
+可指定单个或多个场景：
+
+```bash
+D2_RUNTIME_SCENARIOS=basic bash ../D2_runtime_test.sh
+D2_RUNTIME_SCENARIOS=cross_pg bash ../D2_runtime_test.sh
+D2_RUNTIME_SCENARIOS=split,fragmented,duplicate_device bash ../D2_runtime_test.sh
+```
+
+`cross_pg` 场景会将 rollout TP 临时设置为 2，使一台 4 卡 rollout 节点
+生成两个 native PG，再用两个 PG 的真实 claims 组成一个 borrowed replica。
+每个场景独立启动，成功后默认清理 borrowed Worker/server；日志保存在
+`${VERL_REPO_DIR}/logs/d2_runtime/`。脚本只把带有明确
+`D2_RUNTIME_RESULT` 的结果视为场景完成，不能用 main_ppo 进程或 `tee` 的
+退出码单独推断 borrowed 创建成功。
+
+真实测试需要使用小模型和足够低的 `gpu_memory_utilization`，因为 donor 和
+borrowed engine 会共享物理设备；Ray 的 fractional GPU 记账不提供显存隔离。
+
 在可用的 Linux Python 环境中，从插件仓根执行：
 
 ```bash
@@ -199,9 +257,13 @@ python -m pytest -q -p no:cacheprovider \
 
 通过标准：D1 契约、D2 纯布局和 native 父类适配测试全部通过；不得因为没有 Ray 而把 GPU 测试标为成功。
 
-### 5.2 真实 Ray/GPU 验收
+### 5.3 真实 Ray/GPU 验收记录
 
-使用 D0 已能跑通的 Ascend/CUDA 启动环境，在 GS 预先产生一份**全局可查找**且确实有余量的 donor PG，然后由 borrower TaskRunner 调用 manager 的 `create_borrowed_replica(spec)`。每个场景至少保存：
+当前 GS 尚未提供创建命令，因此 D2 的临时验收由 `D2_runtime_test.sh` 在同一
+main_ppo 进程中先创建 native replica，再从其 resource pool 和 Worker
+runtime context 读取一份**真实可查找**的 donor PG，最后由 Rollouter 测试
+hook 调用正式的 `create_borrowed_replica(spec)`。GS 未来提供 spec 后复用同一
+manager 接口。每个场景至少保存：
 
 - PG name、Ray namespace、bundle index 和 claim JSON；
 - 每个 rank 的 actor ID、node ID、accelerator ID、CPU/GPU fraction；
@@ -219,13 +281,15 @@ python -m pytest -q -p no:cacheprovider \
 6. 跨节点均匀布局和不均匀布局拒绝；
 7. 缺失 PG、设备不匹配、engine 启动异常时不返回 READY，且 donor PG 未被删除。
 
-本阶段暂不以业务请求成功作为通过条件，因为 LB 和参数 bootstrap 归 D3/D4；只确认 runtime 能启动、实际设备正确、endpoint 已建立且失败边界可定位。
+本阶段暂不以业务请求成功作为通过条件，因为 CE 注册、参数 bootstrap 和 LB
+接流归 D3/D4；只确认 runtime 能启动、实际设备正确、endpoint 已建立且失败
+边界可定位。
 
 ## 6. 当前验证记录与限制
 
 - 代码修改范围仅在 `verl-multi-task` 仓库；外层原生 `verl` 未修改。
 - `uv run ... py_compile` 已通过。
-- D2 相关隔离测试、D1 契约测试和 wiring 测试已通过：`22 passed`。这些测试没有启动 Ray、GPU 或 vLLM engine。
+- D2 相关隔离测试、D1 契约测试和 wiring 测试已通过：`22 passed`。服务器上的 native 适配组合测试已达到 `33 passed`；这些测试仍不等于 borrowed engine 已启动。
 - 全量 `tests/unit` 在当前环境收集失败，因为本地虚拟环境没有 `omegaconf`；原生适配测试收集还需要 `ray`。这两项不能记录为通过，应在服务器的完整 verl 环境中执行。
 - D2 代码依赖与实际运行环境匹配的 verl/Ray/vLLM/vLLM-Ascend 版本。导入路径、vLLM engine 启动失败和设备标识格式不一致，都应先记录为环境/兼容性问题，不应通过修改 donor 资源归属来规避。
-- D2 完成后仍需用户以真实 Ray/GPU 日志验收，才能进入 D3 的 CE 通信域和 bootstrap 开发。
+- `D2_runtime_test.sh` 是进入 D3 前的真实创建验收入口；只有保留 `RUNTIME_READY`、实际 Actor/device/PG 映射和失败清理证据后，D2 才能进入 D3 的 CE 通信域和 bootstrap 开发。
