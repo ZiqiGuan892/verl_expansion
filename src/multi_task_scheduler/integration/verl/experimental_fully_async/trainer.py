@@ -89,6 +89,7 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
             registration = await self.register_replica(replica_rank)
             registered = registration.get("state") in {"REGISTERED", "ALREADY_REGISTERED"}
             bootstrap = await self.bootstrap_replica(replica_rank)
+            memory = await self.rollouter.restore_d3_donors.remote(replica_rank)
         except Exception:
             # The hook owns this test runtime.  Do best-effort local cleanup so
             # a failed bootstrap cannot leave vLLM/CE actors consuming the
@@ -111,6 +112,7 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
             "replica_rank": replica_rank,
             "registration": registration,
             "bootstrap": bootstrap,
+            "memory": memory,
             "bootstrap_version": bootstrap["version"],
             "state": "WEIGHTS_READY",
         }

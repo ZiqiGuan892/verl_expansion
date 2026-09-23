@@ -64,6 +64,47 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 return record
         raise KeyError(f"unknown borrowed replica_rank: {replica_rank}")
 
+    def _local_native_donors(self, spec: dict) -> list:
+        """Return native replicas in this task that own the requested claims.
+
+        GS normally coordinates a donor task separately.  The D2/D3 runtime
+        smoke path uses native replicas created by this same manager, so it can
+        safely put those donors to sleep before launching a second engine on
+        their physical devices.  A borrower task must never guess or mutate a
+        foreign task's replicas.
+        """
+        requested = {int(claim["donor_replica_rank"]) for claim in spec["claims"]}
+        donors = [
+            replica
+            for replica in self.rollout_replicas
+            if getattr(replica, "allocation_kind", "native") == "native"
+            and int(getattr(replica, "replica_rank", -1)) in requested
+        ]
+        by_rank = {int(replica.replica_rank): replica for replica in donors}
+        missing = sorted(requested - set(by_rank))
+        if missing:
+            raise RuntimeError(
+                "D2/D3 local smoke requires native donor replicas for ranks "
+                f"{missing}; cross-task donors must be slept by their owner TaskRunner"
+            )
+        return [by_rank[rank] for rank in sorted(requested)]
+
+    @staticmethod
+    async def _test_memory_call(replica, method: str) -> None:
+        """Call an opt-in memory fixture on every node of one test replica."""
+        await asyncio.gather(*(getattr(server, method).remote() for server in replica.servers))
+
+    async def restore_d3_donors(self, replica_rank: int) -> dict:
+        """Release borrowed KV before restoring donors for the training loop."""
+        record = self._borrowed_record_by_rank(replica_rank)
+        await self._test_memory_call(record["replica"], "hold_kv_cache_for_ce_test")
+        for donor in record.get("sleeping_donors", []):
+            await self._test_memory_call(donor, "wake_for_runtime_test")
+        record["sleeping_donors"] = []
+        result = {"replica_rank": replica_rank, "state": "DONORS_RESTORED_BORROWER_KV_RELEASED"}
+        print(f"D3_MEMORY_RESULT {json.dumps(result, sort_keys=True)}")
+        return result
+
     async def get_replica_for_ce(self, replica_rank: int):
         """Return the local borrowed replica projection for Trainer CE wiring."""
         if isinstance(replica_rank, bool) or not isinstance(replica_rank, int) or replica_rank < 0:
@@ -95,7 +136,13 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         replica = record.get("replica")
         if replica is None:
             return {"replica_rank": replica_rank, "state": "NOT_FOUND"}
+        # Wait for device allocations to be released before restoring donor
+        # memory. Killing Ray actors alone does not acknowledge that release.
+        await self._test_memory_call(replica, "sleep_for_runtime_test")
         cleanup = await replica._cleanup_runtime()
+        for donor in record.get("sleeping_donors", []):
+            await self._test_memory_call(donor, "wake_for_runtime_test")
+        record["sleeping_donors"] = []
         self.rollout_replicas = [item for item in self.rollout_replicas if item is not replica]
         record["state"] = "DESTROYED"
         record["cleanup"] = copy.deepcopy(cleanup)
@@ -648,10 +695,21 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
     async def run_d2_runtime_smoke(self, scenario: str, cleanup_after_test: bool = True) -> dict:
         """Run one real-placement D2 create scenario; CE/LB remain untouched."""
         spec, expected_failure = await self._build_d2_test_spec(scenario)
+        sleeping_donors = []
+        if not expected_failure:
+            # The local smoke donor owns the same physical NPU claimed by the
+            # borrower. Its standalone server must offload weights first;
+            # Ray's fractional GPU accounting does not provide memory isolation.
+            sleeping_donors = self._local_native_donors(spec)
+            for donor in sleeping_donors:
+                await self._test_memory_call(donor, "sleep_for_runtime_test")
+            print(f"RUNTIME_TEST_DONORS_SLEEPING {[donor.replica_rank for donor in sleeping_donors]}")
         try:
             receipt = await self.create_borrowed_replica(spec)
         except Exception as exc:
             if not expected_failure:
+                # Failed engine startup has no acknowledged device release.
+                # Abort this test job; do not wake donors into unknown memory.
                 raise
             result = {"scenario": scenario, "status": "EXPECTED_FAILURE", "error": str(exc)}
             print(f"D2_RUNTIME_RESULT {json.dumps(result, sort_keys=True)}")
@@ -667,12 +725,22 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         if state != "RUNTIME_READY":
             raise RuntimeError(f"D2 scenario {scenario} did not reach RUNTIME_READY: {receipt}")
 
+        record = self.borrowed_operations.get(spec["lease_id"])
+        if record is not None:
+            # Keep donor objects private to the manager record.  The receipt
+            # remains serializable and does not expose actor handles.
+            record["sleeping_donors"] = sleeping_donors
+
         cleanup = None
         if cleanup_after_test:
-            record = self.borrowed_operations.get(spec["lease_id"])
             replica = record.get("replica") if record else None
             if replica is not None:
+                await self._test_memory_call(replica, "sleep_for_runtime_test")
                 cleanup = await replica._cleanup_runtime()
+            for donor in sleeping_donors:
+                await self._test_memory_call(donor, "wake_for_runtime_test")
+            if record is not None:
+                record["sleeping_donors"] = []
         result = {"scenario": scenario, "status": "PASS", "receipt": receipt, "cleanup": cleanup}
         print(f"D2_RUNTIME_RESULT {json.dumps(result, sort_keys=True, default=str)}")
         return result

@@ -212,3 +212,57 @@ D3 marker 和训练进程退出码均满足检查，才能将 D3 记为真实环
 - D3 不调用 LB `commit_ready()`，所以 bootstrap 成功后 replica 仍不会接收业务请求。接流和在途请求处理属于 D4/生命周期实现。
 - D3 的 Ascend HCCL 适配只为通信域销毁接口提供插件层兼容；若目标环境的
   `vllm-ascend` API 不同，应调整该插件后端，不要修改原生 `verl/checkpoint_engine/hccl_checkpoint_engine.py`。
+
+## 5. D3 borrowed 创建的显存交接修复
+
+### 5.1 失败证据
+
+在 1 节点 8 卡服务器上运行 `D3_RUNTIME_SCENARIOS=basic bash ../D3_test.sh` 时，native
+TP=4 已经在目标 4 张 NPU 上运行。borrowed Engine 的 Worker 初始化失败日志为：
+
+```text
+Free memory on device (3.05/29.49 GiB) on startup is less than
+desired GPU memory utilization (0.3, 8.85 GiB)
+```
+
+这发生在 vllm-ascend 的 `Worker.init_device()`，不是 CE 注册、HCCL finalize 或 LB 接流。
+原生 standalone `vLLMHttpServer.sleep()` 对该模式是 no-op，因此不能直接用原生
+`replica.sleep()` 释放 donor 显存。
+
+### 5.2 插件修改
+
+`MultiTaskvLLMHttpServer` 增加 `sleep_for_runtime_test()` 和
+`wake_for_runtime_test()`。两者只在 `node_rank == 0` 调用 vLLM Engine 的
+`sleep(level=1)`/`wake_up(tags=["weights", "kv_cache"])`，并校验测试脚本显式打开
+`enable_sleep_mode`、`free_cache_engine`。level 1 保留 CPU 权重、丢弃 KV，适合在同一
+批物理卡上启动第二个 Engine；它不覆盖原生 `sleep()`，也不改变生产生命周期接口。
+
+`MultiTaskLLMServerManager.run_d2_runtime_smoke()` 在成功场景创建 borrowed 前，按 claims
+找到当前任务的 native donors，并对 donor 的所有 server 调用该测试接口。borrowed 创建
+完成后，测试清理阶段先让 borrowed 进入 sleep，再销毁其本次测试 Actor，最后恢复 donor。
+
+D3 bootstrap 额外调用 `hold_kv_cache_for_ce_test()`，只释放 borrowed KV、保留权重以便
+CE 继续执行；随后 `restore_d3_donors()` 恢复 donor 并输出
+`D3_MEMORY_RESULT ... DONORS_RESTORED_BORROWER_KV_RELEASED`。该安排只用于小模型的
+单节点 D3 smoke：borrowed 的模型权重与 donor 恢复后的模型权重仍可能共占设备显存，若
+更大模型或显存余量不足，应在 borrowed 活跃期间保持 donor asleep。
+
+### 5.3 验证
+
+`D2_runtime_test.sh`、`D3_test.sh` 增加：
+
+```text
+actor_rollout_ref.rollout.enable_sleep_mode=true
+actor_rollout_ref.rollout.free_cache_engine=true
+```
+
+运行：
+
+```bash
+D3_RUNTIME_SCENARIOS=basic bash ../D3_test.sh
+```
+
+应依次看到 `RUNTIME_TEST_DONORS_SLEEPING`、`D3_BOOTSTRAP_RESULT`、
+`DONORS_RESTORED_BORROWER_KV_RELEASED` 和 `D3_NORMAL_SYNC_RESULT`。如果再次出现
+`Free memory on device ... less than desired GPU memory utilization`，需保存完整 Worker
+日志，确认目标 vllm-ascend 版本确实实现了 level-1 sleep 的显存释放。

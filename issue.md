@@ -263,3 +263,64 @@ src/multi_task_scheduler/checkpoint/hccl_checkpoint_engine.py
 - D3 CE/borrowed 目标测试结果：`37 passed`；
 - 目标服务器需要重新执行 `D3_RUNTIME_SCENARIOS=split bash ../D3_test.sh`，确认出现
   `WEIGHTS_READY` 和 `FULL_SYNC_READY`。插件单元测试不能替代真实 HCCL 通信验证。
+
+## 6. D3 borrowed Engine 启动时每卡显存不足
+
+### 现象
+
+`D3_RUNTIME_SCENARIOS=basic bash ../D3_test.sh` 在创建 borrowed replica 时失败。EngineCore
+包装异常之前的 Worker 日志给出了实际原因：
+
+```text
+ValueError: Free memory on device (3.05/29.49 GiB) on startup is less than
+desired GPU memory utilization (0.3, 8.85 GiB). Decrease GPU memory utilization
+or reduce GPU memory used by other processes.
+```
+
+4 个 Worker 都在 `vllm_ascend.worker.Worker.init_device()` 处失败，随后
+`WorkerProc initialization failed` 向上包装成 `Engine core initialization failed`，所以
+`create_borrowed_replica()` 返回 `RUNTIME_CREATION_FAILED`。
+
+### 根因
+
+basic 场景的 native replica 是 TP=4，并且已经在同一批 4 张 NPU 上启动。原生
+`vLLMReplica.sleep()` 在 `STANDALONE` 模式下只记录日志，不调用 Engine 的 sleep；因此
+创建 borrowed replica 时，native 权重和 KV cache 仍占用显存。Ray 的 fractional GPU/CPU
+资源配额只影响调度，不提供显存隔离，第二个 TP=4 Engine 只能看到每卡约 3 GiB 的空闲空间。
+
+### 最小修复
+
+只在插件仓库中增加 D3/D2 runtime smoke 使用的显存交接接口：
+
+```text
+src/multi_task_scheduler/rollout/http_server.py
+```
+
+`MultiTaskvLLMHttpServer.sleep_for_runtime_test()` 在 server 的主节点直接调用
+`self.engine.sleep(level=1)`。level 1 将权重转移到 CPU 并丢弃 KV cache，释放 donor 的
+设备显存；脚本显式设置 `enable_sleep_mode=true` 和 `free_cache_engine=true`。创建
+borrowed 前，`MultiTaskLLMServerManager` 对本任务 smoke 使用的 native donors 调用该
+接口，之后才调用原有 `create_borrowed_replica()`，不改变原生 PG、Worker 或
+`launch_servers()` 的创建流程。
+
+D3 bootstrap 完成后，测试钩子释放 borrowed 的 KV cache，再恢复 donor；这样参数同步
+仍能验证 borrowed Worker，而 donor 可以继续服务主训练循环。该显存交接是 D2/D3 的
+一次性测试夹具，跨任务生产调度仍需由 donor 所属 TaskRunner 执行 sleep/wake。
+
+### 回退范围与限制
+
+上一轮试图在 `_cleanup_runtime()` 中扫描并回收 vLLM EngineCore 子进程的改动已回退；本次
+修复没有引入 psutil、子进程扫描或修改原生 verl。若 EngineCore 在异常启动后留下子进程，
+仍应先结束本次训练进程再重试。当前日志已证明本次失败点是显存启动阈值，不是上述清理告警。
+
+### 验证
+
+真实服务器上重新执行：
+
+```bash
+D3_RUNTIME_SCENARIOS=basic bash ../D3_test.sh
+```
+
+日志中应先出现 `RUNTIME_TEST_DONORS_SLEEPING`，再出现 borrowed 的
+`D3_BOOTSTRAP_RESULT`。若仍在 `Worker.init_device()` 报显存不足，应保留该 Worker 的
+完整日志，并检查 level-1 sleep 是否在目标 vllm-ascend 版本实际释放了设备显存。

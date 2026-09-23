@@ -113,6 +113,8 @@ for scenario in $(printf '%s' "${D2_RUNTIME_SCENARIOS}" | tr ',' ' '); do
         "trainer.total_training_steps=${TOTAL_TRAINING_STEPS}" \
         "trainer.total_epochs=${TRAIN_TOTAL_EPOCHS}" \
         "rollout.total_rollout_steps=${TOTAL_ROLLOUT_STEPS}" \
+        "actor_rollout_ref.rollout.enable_sleep_mode=true" \
+        "actor_rollout_ref.rollout.free_cache_engine=true" \
         "+multitask.d2_runtime_test.enabled=true" \
         "+multitask.d2_runtime_test.scenario=${scenario}" \
         "+multitask.d2_runtime_test.cleanup_after_test=true" \

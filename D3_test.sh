@@ -92,6 +92,8 @@ for scenario in $(printf '%s' "${D3_RUNTIME_SCENARIOS}" | tr ',' ' '); do
         "trainer.total_training_steps=${TOTAL_TRAINING_STEPS}" \
         "trainer.total_epochs=${TRAIN_TOTAL_EPOCHS}" \
         "rollout.total_rollout_steps=${TOTAL_ROLLOUT_STEPS}" \
+        "actor_rollout_ref.rollout.enable_sleep_mode=true" \
+        "actor_rollout_ref.rollout.free_cache_engine=true" \
         "actor_rollout_ref.rollout.checkpoint_engine.backend=multitask_hccl" \
         "actor_rollout_ref.rollout.checkpoint_engine.custom_backend_module=multi_task_scheduler.checkpoint.hccl_checkpoint_engine" \
         "+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.multitask_hccl.rebuild_group=true" \
@@ -118,6 +120,10 @@ for scenario in $(printf '%s' "${D3_RUNTIME_SCENARIOS}" | tr ',' ' '); do
     if ! grep -Fq "D3_NORMAL_SYNC_RESULT" "${log_file}" || \
         ! grep -Fq "FULL_SYNC_READY" "${log_file}"; then
         echo "场景 ${scenario} 没有通过 bootstrap 后的普通全成员同步；日志：${log_file}" >&2
+        exit 1
+    fi
+    if ! grep -Fq "DONORS_RESTORED_BORROWER_KV_RELEASED" "${log_file}"; then
+        echo "场景 ${scenario} 未完成 donor 恢复和 borrowed KV 释放；日志：${log_file}" >&2
         exit 1
     fi
     if grep -Eq "Traceback|AssertionError" "${log_file}"; then
