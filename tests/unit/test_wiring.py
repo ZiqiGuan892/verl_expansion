@@ -236,7 +236,7 @@ def test_trainer_uses_rollouter_replica_projection_for_native_checkpoint_manager
     factory = Mock(return_value=object())
     trainer_class = _isolated_class(
         f"{INTEGRATION}/trainer.py", "MultiTaskFullyAsyncTrainer", object,
-        omega_conf_to_dataclass=converter, MultiTaskCheckpointEngineManager=factory,
+        omega_conf_to_dataclass=converter, MultiTaskCheckpointEngineManager=factory, asyncio=asyncio,
     )
     trainer = trainer_class()
     trainer.config = SimpleNamespace(actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(checkpoint_engine=object())))

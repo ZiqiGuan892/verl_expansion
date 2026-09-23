@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Keep the native Trainer behavior and select the extended CE Manager."""
+"""Keep native training while exposing CE membership/bootstrap boundaries."""
+
+import asyncio
+import json
 
 import ray
 
@@ -27,6 +30,13 @@ from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_
 class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
     """Own the CE Manager in this Actor; inherit training and weight synchronization."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.parameter_snapshot_gate = asyncio.Lock()
+        self._d3_bootstrap_rank = None
+        self._d3_cleanup_after_test = True
+        self._d3_bootstrap_result = None
+
     async def _setup_checkpoint_manager(self):
         """Preserve native trainer.py:217-224; replace only the Manager class."""
         replicas = await self.rollouter.get_replicas.remote()
@@ -35,3 +45,99 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
             config=checkpoint_engine_config, actor_wg=self.actor_wg, replicas=replicas
         )
         print(f"[FullyAsyncTrainer] Checkpoint manager initialized (backend={checkpoint_engine_config.backend})")
+
+    async def register_replica(self, replica_rank: int) -> dict:
+        """Register a manager-owned replica as pending CE membership."""
+        replica = await self.rollouter.get_borrowed_replica_for_ce.remote(replica_rank)
+        result = await self.checkpoint_manager.register_replica(replica)
+        return result
+
+    async def bootstrap_replica(self, replica_rank: int) -> dict:
+        """Bootstrap one replica from one stable snapshot of current parameters."""
+        replica = await self.rollouter.get_borrowed_replica_for_ce.remote(replica_rank)
+        async with self.parameter_snapshot_gate:
+            snapshot_version = int(self.current_param_version)
+            result = await self.checkpoint_manager.bootstrap_replica(replica, snapshot_version)
+            await self.rollouter.mark_replica_serving_version.remote(replica_rank, snapshot_version)
+            return result
+
+    async def unregister_replica(self, replica_rank: int) -> dict:
+        """Remove one replica from future CE snapshots without destroying actors."""
+        replica = await self.rollouter.get_borrowed_replica_for_ce.remote(replica_rank)
+        return await self.checkpoint_manager.unregister_replica(replica)
+
+    async def load_checkpoint(self):
+        """Load native checkpoints, then optionally run the D3 bootstrap hook."""
+        result = await super().load_checkpoint()
+        await self._maybe_run_d3_bootstrap_smoke()
+        return result
+
+    async def _maybe_run_d3_bootstrap_smoke(self) -> None:
+        config_get = getattr(self.config, "get", None)
+        multitask_config = config_get("multitask", {}) if callable(config_get) else getattr(self.config, "multitask", {})
+        test_config = multitask_config.get("d3_bootstrap_test", {}) if multitask_config is not None else {}
+        if not bool(test_config.get("enabled", False)) or self._d3_bootstrap_rank is not None:
+            return
+        scenario = str(test_config.get("scenario", "split"))
+        self._d3_cleanup_after_test = bool(test_config.get("cleanup_after_test", True))
+        prepared = None
+        replica_rank = None
+        registered = False
+        try:
+            prepared = await self.rollouter.run_d3_runtime_smoke.remote(scenario)
+            replica_rank = int(prepared["replica_rank"])
+            registration = await self.register_replica(replica_rank)
+            registered = registration.get("state") in {"REGISTERED", "ALREADY_REGISTERED"}
+            bootstrap = await self.bootstrap_replica(replica_rank)
+        except Exception:
+            # The hook owns this test runtime.  Do best-effort local cleanup so
+            # a failed bootstrap cannot leave vLLM/CE actors consuming the
+            # next D3 attempt.  Production lifecycle recovery is still outside
+            # D3 and is not invoked by ordinary training.
+            if registered and replica_rank is not None:
+                try:
+                    await self.unregister_replica(replica_rank)
+                except Exception:
+                    pass
+            if prepared is not None and replica_rank is not None:
+                try:
+                    await self.rollouter.cleanup_d3_runtime.remote(replica_rank)
+                except Exception:
+                    pass
+            raise
+        self._d3_bootstrap_rank = replica_rank
+        self._d3_bootstrap_result = {
+            "scenario": scenario,
+            "replica_rank": replica_rank,
+            "registration": registration,
+            "bootstrap": bootstrap,
+            "bootstrap_version": bootstrap["version"],
+            "state": "WEIGHTS_READY",
+        }
+        print(
+            "D3_BOOTSTRAP_RESULT "
+            f"{json.dumps(self._d3_bootstrap_result, sort_keys=True, default=str)}"
+        )
+
+    async def _fit_update_weights(self) -> dict | None:
+        """Serialize normal sync with target bootstrap and verify one full sync."""
+        async with self.parameter_snapshot_gate:
+            result = await super()._fit_update_weights()
+        if result is not None and self._d3_bootstrap_rank is not None:
+            rank = self._d3_bootstrap_rank
+            version = self.checkpoint_manager.last_synced_versions.get(rank)
+            full_sync = {
+                "replica_rank": rank,
+                "state": "FULL_SYNC_READY" if version == self.current_param_version else "FAILED",
+                "version": version,
+                "expected_version": self.current_param_version,
+            }
+            print(f"D3_NORMAL_SYNC_RESULT {json.dumps(full_sync, sort_keys=True)}")
+            if full_sync["state"] != "FULL_SYNC_READY":
+                raise RuntimeError(f"D3 full sync did not update borrowed replica: {full_sync}")
+            if self._d3_cleanup_after_test:
+                await self.unregister_replica(rank)
+                cleanup = await self.rollouter.cleanup_d3_runtime.remote(rank)
+                self._d3_bootstrap_result["cleanup"] = cleanup
+            self._d3_bootstrap_rank = None
+        return result

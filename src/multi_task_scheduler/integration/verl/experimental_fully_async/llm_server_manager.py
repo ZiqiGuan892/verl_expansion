@@ -58,6 +58,49 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             group_scheduler=self.group_scheduler,
         )
 
+    def _borrowed_record_by_rank(self, replica_rank: int) -> dict:
+        for record in self.borrowed_operations.values():
+            if record.get("replica_rank") == replica_rank:
+                return record
+        raise KeyError(f"unknown borrowed replica_rank: {replica_rank}")
+
+    async def get_replica_for_ce(self, replica_rank: int):
+        """Return the local borrowed replica projection for Trainer CE wiring."""
+        if isinstance(replica_rank, bool) or not isinstance(replica_rank, int) or replica_rank < 0:
+            raise ValueError("replica_rank must be a non-negative integer")
+        record = self._borrowed_record_by_rank(replica_rank)
+        replica = record.get("replica")
+        if replica is None or record.get("state") != "RUNTIME_READY":
+            raise RuntimeError(f"borrowed replica {replica_rank} is not RUNTIME_READY")
+        return replica
+
+    async def register_borrowed_replica_for_ce(self, replica_rank: int) -> dict:
+        """Expose a borrowed runtime to local replica projections without LB publication."""
+        replica = await self.get_replica_for_ce(replica_rank)
+        if replica not in self.rollout_replicas:
+            self.rollout_replicas.append(replica)
+        return {"replica_rank": replica_rank, "state": "RUNTIME_REGISTERED"}
+
+    async def mark_replica_serving_version(self, replica_rank: int, version: int) -> dict:
+        """Persist CE's confirmed version on the manager-owned replica object."""
+        if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+            raise ValueError("version must be a non-negative integer")
+        replica = await self.get_replica_for_ce(replica_rank)
+        replica.serving_version = version
+        return {"replica_rank": replica_rank, "serving_version": version}
+
+    async def cleanup_d3_runtime(self, replica_rank: int) -> dict:
+        """Clean only the temporary D3 borrowed actors after CE checks."""
+        record = self._borrowed_record_by_rank(replica_rank)
+        replica = record.get("replica")
+        if replica is None:
+            return {"replica_rank": replica_rank, "state": "NOT_FOUND"}
+        cleanup = await replica._cleanup_runtime()
+        self.rollout_replicas = [item for item in self.rollout_replicas if item is not replica]
+        record["state"] = "DESTROYED"
+        record["cleanup"] = copy.deepcopy(cleanup)
+        return {"replica_rank": replica_rank, "state": "DESTROYED", "cleanup": cleanup}
+
     @staticmethod
     def _read_max_colocate_count(config) -> int:
         """Read M without requiring a particular OmegaConf implementation."""

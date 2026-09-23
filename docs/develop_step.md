@@ -4,7 +4,7 @@
 
 本版取代旧计划的 D00—D14。D0 与历史 D00 是同一步；交接文件中的“D01 尚未获准开始”，对应本版 D1 的进入门禁。旧计划中的全量生命周期实现不再是本轮交付目标。
 
-**当前状态：D0 已由用户确认验收通过；D1 已由用户确认验收通过；D2 代码和真实 main_ppo 测试入口已完成，详细记录在 [D2_develop.md](D2_develop.md)，等待服务器运行 `D2_runtime_test.sh` 留存 runtime 证据。D3—D4 未开始。**
+**当前状态：D0、D1 已由用户确认验收通过；D2 的 split、fragmented、missing_pg、cross_pg 真实场景已通过；D3 代码、单元测试和真实 main_ppo 测试入口已完成，详细记录在 [D3_develop.md](D3_develop.md)，等待服务器运行 `D3_test.sh` 留存 CE bootstrap 证据。D4 未开始。**
 
 ## 1. 本轮范围与实现边界
 
@@ -113,6 +113,8 @@
 
 ### D3：CE 成员管理、target-only bootstrap 与通信域验证
 
+**本阶段实现记录：** [D3_develop.md](D3_develop.md)。D3 已完成本地实现和无 GPU 单元验证；真实服务器验收使用 `D3_test.sh`，在用户执行前不将 D3 标记为验收通过。
+
 **目标：** RUNTIME_READY replica 在当前 rollout 窗口加载一次稳定的 borrower 权重，获得可验证的 serving version，后续可参加普通同步。
 
 **修改范围：** `checkpoint/checkpoint_engine_manager.py`、`integration/verl/experimental_fully_async/trainer.py`，以及必要的 replica 投影查询。传输协议、Worker 和 ServerAdapter 继续复用原生实现。
@@ -126,9 +128,9 @@
 
 训练端、已有 native 接收端和新 borrowed 接收端的 backend 均须在初始化前应用 `rebuild_group=True`，按任务/操作隔离通信域名称。不能等新成员加入时才更改其中一端。正常 finalize 已成功时，unregister 不重复清理；backend 或 Actor 长期资源的故障恢复不在本阶段扩展为完整 destroy 流程。
 
-**验收文件：** 计划新增 `tests/unit/test_checkpoint_membership.py`、`tests/gpu/test_borrowed_bootstrap.py`。真实验证使用可区分的 borrower 权重快照，检查 adapter/engine 实际加载结果或可核验的权重/推理结果，不能只断言版本字典被赋值。
+**验收文件：** 已新增 `tests/unit/test_checkpoint_membership.py` 和 `D3_test.sh`。本地隔离测试覆盖注册幂等、pending 过滤、target-only 调用顺序、版本记录、普通同步和注销；真实验证必须执行 `D3_test.sh`，并结合 CE/engine 日志确认实际加载结果，不能只断言版本字典被赋值。
 
-**通过条件：** 冻结版本与实际加载一致，target-only 与后续普通同步都完成，旧成员服务未被 bootstrap 全量中断，失败不产生 READY。记录从 RUNTIME_READY 到权重确认的耗时，证明可在测试 rollout 窗口内完成；用户确认后进入 D4。
+**通过条件：** 冻结版本与实际加载一致，target-only 与后续普通同步都完成，旧成员服务未被 bootstrap 全量中断，失败不产生 READY。服务器日志必须同时出现 `D3_BOOTSTRAP_RESULT` 的 `WEIGHTS_READY` 和 `D3_NORMAL_SYNC_RESULT` 的 `FULL_SYNC_READY`；记录从 RUNTIME_READY 到权重确认的耗时，证明可在测试 rollout 窗口内完成；用户确认后进入 D4。
 
 ### D4：TaskRunner 入口、LB 接流与端到端验收
 

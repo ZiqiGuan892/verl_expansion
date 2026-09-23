@@ -1,7 +1,230 @@
-"""Native checkpoint coordinator extension without new membership or sync logic."""
+"""Checkpoint manager extensions for borrowed-replica membership and bootstrap."""
 
-from verl.checkpoint_engine.base import CheckpointEngineManager
+import asyncio
+
+import ray
+
+from verl.checkpoint_engine.base import (
+    CheckpointEngineManager,
+    _worker_cls,
+)
+from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
+from verl.utils.device import get_device_name
 
 
 class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
-    """Trainer creates this ordinary object; all weight synchronization stays native."""
+    """Extend native CE synchronization with target-only replica bootstrap.
+
+    The object remains trainer-local.  It stores rollout replica projections and
+    worker handles, but never owns the global scheduler or the load balancer.
+    Native ``update_weights`` is reused for the normal effective set; borrowed
+    bootstrap uses the same backend primitives with a temporary target group.
+    """
+
+    def __init__(self, config, actor_wg, replicas):
+        super().__init__(config=config, actor_wg=actor_wg, replicas=replicas)
+        self.sync_gate = asyncio.Lock()
+        self.sync_state = "IDLE"
+        self.inflight_replicas = []
+        self.last_synced_versions: dict[int, int] = {}
+        self.pending_bootstrap: dict[int, int | None] = {}
+
+    @staticmethod
+    def _replica_rank(replica) -> int:
+        rank = getattr(replica, "replica_rank", None)
+        if isinstance(rank, bool) or not isinstance(rank, int) or rank < 0:
+            raise ValueError("replica must expose a non-negative integer replica_rank")
+        return rank
+
+    @staticmethod
+    def _handle_key(handle):
+        actor_id = getattr(handle, "_actor_id", None)
+        if actor_id is None:
+            return str(handle)
+        hex_method = getattr(actor_id, "hex", None)
+        return hex_method() if callable(hex_method) else str(actor_id)
+
+    @classmethod
+    def _same_workers(cls, left, right) -> bool:
+        return [cls._handle_key(item) for item in left] == [cls._handle_key(item) for item in right]
+
+    def _find_replica_unlocked(self, replica_rank: int):
+        for replica in self.replicas:
+            if getattr(replica, "replica_rank", None) == replica_rank:
+                return replica
+        return None
+
+    def _effective_replicas_unlocked(self):
+        return [
+            replica
+            for replica in self.replicas
+            if getattr(replica, "replica_rank", None) not in self.pending_bootstrap
+        ]
+
+    async def register_replica(self, replica) -> dict:
+        """Add a RUNTIME_READY replica to the CE projection as pending.
+
+        Registration is idempotent for the same rank and worker handles.  The
+        replica is excluded from ordinary full-set synchronization until its
+        target-only bootstrap succeeds.
+        """
+        rank = self._replica_rank(replica)
+        workers = list(getattr(replica, "workers", []))
+        if len(workers) != int(getattr(replica, "world_size", -1)) or not workers:
+            raise ValueError("replica worker count must equal replica world_size")
+        async with self.sync_gate:
+            current = self._find_replica_unlocked(rank)
+            if current is not None:
+                if not self._same_workers(getattr(current, "workers", []), workers):
+                    raise ValueError(f"replica_rank {rank} is already registered with different workers")
+                return {
+                    "replica_rank": rank,
+                    "state": "ALREADY_REGISTERED",
+                    "pending": rank in self.pending_bootstrap,
+                }
+            self.replicas.append(replica)
+            self.pending_bootstrap[rank] = None
+            return {"replica_rank": rank, "state": "REGISTERED", "pending": True}
+
+    async def unregister_replica(self, replica_or_rank) -> dict:
+        """Remove a replica from future CE snapshots and version tracking."""
+        if isinstance(replica_or_rank, int) and not isinstance(replica_or_rank, bool):
+            rank = replica_or_rank
+            if rank < 0:
+                raise ValueError("replica_rank must be a non-negative integer")
+        else:
+            rank = self._replica_rank(replica_or_rank)
+        async with self.sync_gate:
+            replica = self._find_replica_unlocked(rank)
+            if replica is None:
+                return {"replica_rank": rank, "state": "NOT_REGISTERED"}
+            self.replicas = [item for item in self.replicas if getattr(item, "replica_rank", None) != rank]
+            self.pending_bootstrap.pop(rank, None)
+            self.last_synced_versions.pop(rank, None)
+            if getattr(replica, "serving_version", None) is not None:
+                replica.serving_version = None
+            return {"replica_rank": rank, "state": "UNREGISTERED"}
+
+    async def update_weights(self, global_steps: int = None):
+        """Run native full-set sync while serializing membership changes."""
+        async with self.sync_gate:
+            if self.sync_state == "BLOCKED":
+                raise RuntimeError("checkpoint manager is BLOCKED after a previous sync failure")
+            self.sync_state = "SYNCING"
+            self.inflight_replicas = list(self._effective_replicas_unlocked())
+            previous = self.replicas
+            self.replicas = list(self.inflight_replicas)
+            try:
+                result = await super().update_weights(global_steps=global_steps)
+                version = int(global_steps) if global_steps is not None else None
+                if version is not None:
+                    for replica in self.inflight_replicas:
+                        rank = self._replica_rank(replica)
+                        self.last_synced_versions[rank] = version
+                        replica.serving_version = version
+                self.sync_state = "IDLE"
+                return result
+            except Exception:
+                self.sync_state = "BLOCKED"
+                raise
+            finally:
+                self.replicas = previous
+                if self.sync_state == "IDLE":
+                    self.inflight_replicas = []
+
+    async def bootstrap_replica(self, replica, snapshot_version: int) -> dict:
+        """Synchronize one pending replica with the frozen trainer snapshot.
+
+        The temporary worker group contains only ``replica.workers``.  The
+        actor group and target group use the native backend topology builder,
+        then finalize the group before the replica is made effective.
+        """
+        rank = self._replica_rank(replica)
+        if isinstance(snapshot_version, bool) or not isinstance(snapshot_version, int) or snapshot_version < 0:
+            raise ValueError("snapshot_version must be a non-negative integer")
+        async with self.sync_gate:
+            registered = self._find_replica_unlocked(rank)
+            if registered is None or not self._same_workers(getattr(registered, "workers", []), replica.workers):
+                raise ValueError(f"replica_rank {rank} is not registered in this checkpoint manager")
+            if rank not in self.pending_bootstrap:
+                if self.last_synced_versions.get(rank) == snapshot_version:
+                    return {"replica_rank": rank, "state": "WEIGHTS_READY", "version": snapshot_version}
+                raise ValueError(f"replica_rank {rank} is not pending bootstrap")
+            if self.backend == "naive":
+                raise NotImplementedError("target-only bootstrap requires a distributed checkpoint backend")
+
+            self.sync_state = "SYNCING"
+            self.inflight_replicas = [registered]
+            target_group = None
+            group_initialized = False
+            kv_released = False
+            generation_aborted = False
+            finalized = False
+            kv_resumed = False
+            generation_resumed = False
+            try:
+                target_group = RayWorkerGroup.from_detached(
+                    name_prefix=f"bootstrap_{rank}_{snapshot_version}",
+                    worker_handles=list(registered.workers),
+                    ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls),
+                    device_name=get_device_name(),
+                )
+                await registered.abort_all_requests()
+                generation_aborted = True
+                await registered.release_kv_cache()
+                kv_released = True
+                self.build_process_group(target_group)
+                group_initialized = True
+                ray.get(
+                    self.actor_wg.update_weights(global_steps=snapshot_version, mode=self.backend)
+                    + target_group.update_weights(global_steps=snapshot_version)
+                )
+                ray.get(
+                    self.actor_wg.execute_checkpoint_engine(["finalize"] * self.actor_wg.world_size)
+                    + target_group.execute_checkpoint_engine(["finalize"] * target_group.world_size)
+                )
+                finalized = True
+                await registered.resume_kv_cache()
+                kv_resumed = True
+                await registered.resume_generation()
+                generation_resumed = True
+                self.last_synced_versions[rank] = snapshot_version
+                self.pending_bootstrap.pop(rank, None)
+                registered.serving_version = snapshot_version
+                self.sync_state = "IDLE"
+                return {
+                    "replica_rank": rank,
+                    "state": "WEIGHTS_READY",
+                    "version": snapshot_version,
+                    "communication": "target_only",
+                    "finalized": True,
+                }
+            except Exception:
+                self.sync_state = "BLOCKED"
+                # Keep pending_bootstrap so the failed replica cannot enter the
+                # normal effective set or be reported as serving-ready.
+                raise
+            finally:
+                if group_initialized and not finalized:
+                    try:
+                        ray.get(
+                            self.actor_wg.execute_checkpoint_engine(["finalize"] * self.actor_wg.world_size)
+                            + target_group.execute_checkpoint_engine(["finalize"] * target_group.world_size)
+                        )
+                    except Exception:
+                        # Preserve the original bootstrap exception; the manager
+                        # remains BLOCKED until an operator handles the failed
+                        # communication transaction.
+                        pass
+                if kv_released and not kv_resumed:
+                    try:
+                        await registered.resume_kv_cache()
+                    except Exception:
+                        pass
+                if generation_aborted and not generation_resumed:
+                    try:
+                        await registered.resume_generation()
+                    except Exception:
+                        pass
+                if self.sync_state == "IDLE":
+                    self.inflight_replicas = []

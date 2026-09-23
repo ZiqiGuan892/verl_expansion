@@ -68,3 +68,27 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
             cleanup_after_test=cleanup_after_test,
         )
         print(f"[D2 RUNTIME] scenario={scenario} status={result.get('status')}")
+
+    async def run_d3_runtime_smoke(self, scenario: str = "split") -> dict:
+        """Create and retain one borrowed runtime for Trainer CE bootstrap."""
+        result = await self.llm_server_manager.run_d2_runtime_smoke(
+            scenario=scenario,
+            cleanup_after_test=False,
+        )
+        if result.get("status") != "PASS":
+            raise RuntimeError(f"D3 runtime preparation did not reach RUNTIME_READY: {result}")
+        replica_rank = result["receipt"]["replica_rank"]
+        await self.llm_server_manager.register_borrowed_replica_for_ce(replica_rank)
+        return {"scenario": scenario, "replica_rank": replica_rank, "receipt": result["receipt"]}
+
+    async def get_borrowed_replica_for_ce(self, replica_rank: int):
+        """Return one manager-owned borrowed replica to the Trainer actor."""
+        return await self.llm_server_manager.get_replica_for_ce(replica_rank)
+
+    async def cleanup_d3_runtime(self, replica_rank: int) -> dict:
+        """Release only the actors created by the D3 smoke scenario."""
+        return await self.llm_server_manager.cleanup_d3_runtime(replica_rank)
+
+    async def mark_replica_serving_version(self, replica_rank: int, version: int) -> dict:
+        """Project the CE-confirmed version onto the manager-owned replica."""
+        return await self.llm_server_manager.mark_replica_serving_version(replica_rank, version)
