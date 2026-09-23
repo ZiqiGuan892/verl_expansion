@@ -320,10 +320,3 @@ D3_RUNTIME_SCENARIOS=split bash ../D3_test.sh
   `D3_NORMAL_SYNC_RESULT`、`FULL_SYNC_READY`，且不再出现 `ResourceWarning: subprocess ... is still running`。
 - 若第一次失败，保留该次日志并检查 `EngineCore` 通用包装异常之前的子进程堆栈；不要在未确认根因时修改
   TP、显存比例或 vLLM 源码版本。
-
-### 环境版本核对
-
-服务器当前记录的 `vllm==0.23.0` 与 `vllm-ascend==0.23.1.dev23` 不是官方矩阵中的一对。
-vLLM Ascend 的 v0.23.0 文档列出的配套版本是 `vllm-ascend==0.23.0` 或
-`vllm-ascend==0.23.0.post1`；因此清理残留进程后仍失败时，应先切换到同一版本线，或使用
-同一官方镜像，再判断是否还有 NPU 显存/ACL/HCCL 问题。
