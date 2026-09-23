@@ -190,19 +190,6 @@ D3 marker 和训练进程退出码均满足检查，才能将 D3 记为真实环
 清理本次测试创建的 borrowed Actor；清理失败不会覆盖原始 bootstrap 异常。该路径只服务
 于测试 hook，不能替代后续阶段的生产 reclaim/destroy 恢复流程。
 
-### 3.4 EngineCore 清理与重复运行
-
-借用的 HTTP server 与 donor 共享物理 NPU，D2/D3 测试结束时不能只依赖 `ray.kill`。
-插件 `MultiTaskvLLMHttpServer.shutdown_engine()` 会先调用 vLLM `AsyncLLM.shutdown()`，
-兼容旧版的 `shutdown_background_loop()`；如果 EngineCore 在初始化异常时尚未挂到
-`self.engine`，则只清理当前 HTTP actor 的递归子进程。随后
-`MultiTaskvLLMReplica._cleanup_runtime()` 才执行 Ray actor kill。
-
-这样可以在连续 smoke run 之间释放 EngineCore 的显存、IPC 和设备上下文。该方法是
-best-effort 清理，receipt 会保留清理错误；它不宣称 lease 已归还，也不执行 donor PG
-删除。若完整日志仍显示 EngineCore 启动失败，应继续查看通用包装异常之前的
-`WorkerProc`/`torch_npu`/`ACL`/`HCCL`/`OOM` 根因行。
-
 ### 3.3 真实验收观察点
 
 需要从日志和 Ray 运行信息确认：

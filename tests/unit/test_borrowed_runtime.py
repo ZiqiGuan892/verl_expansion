@@ -7,7 +7,6 @@ identity remain GPU acceptance tests because they require a live Ray cluster.
 
 import ast
 import copy
-import inspect
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -122,33 +121,3 @@ def test_placement_group_resolution_requires_named_visible_groups():
     with pytest.raises(RuntimeError, match="globally named"):
         replica_class._resolve_placement_groups([{"pg_id": "missing", "bundle_index": 0}])
     assert replica_class._resolve_placement_groups([{"pg_id": "pg-a", "bundle_index": 0}]) == {"pg-a": "handle-a"}
-
-
-def test_http_server_shutdown_prefers_async_shutdown_and_clears_engine():
-    source = Path(__file__).resolve().parents[2] / "src/multi_task_scheduler/rollout/http_server.py"
-    parsed = ast.parse(source.read_text())
-    node = next(item for item in parsed.body if isinstance(item, ast.ClassDef) and item.name == "MultiTaskvLLMHttpServer")
-    node.bases = [ast.Name(id="TestParent", ctx=ast.Load())]
-    module = ast.Module(
-        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), node],
-        type_ignores=[],
-    )
-
-    class _Parent:
-        pass
-
-    class _Engine:
-        def __init__(self):
-            self.calls = 0
-
-        async def shutdown(self):
-            self.calls += 1
-
-    scope = {"TestParent": _Parent, "inspect": inspect, "os": __import__("os")}
-    exec(compile(ast.fix_missing_locations(module), str(source), "exec"), scope)
-    server = scope["MultiTaskvLLMHttpServer"]()
-    server.engine = _Engine()
-
-    result = __import__("asyncio").run(server.shutdown_engine())
-    assert result == {"shutdown": True, "method": "shutdown"}
-    assert server.engine is None
