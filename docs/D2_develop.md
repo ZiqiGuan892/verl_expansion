@@ -324,7 +324,7 @@ AssertionError: number of items:[1] < k_partitions:[4]
 `ppo_mini_batch_size` 和 `rollout.n` 都设成 1，因而只生成 1 条序列；当前
 4 张训练卡的 data-parallel batch 平衡至少需要 4 条可均分的序列。
 
-脚本现恢复为 `ppo_mini_batch_size=8`、`rollout.n=2`，并根据训练 DP、
+脚本现设置 `ppo_mini_batch_size=2`、`rollout.n=2`，并根据训练 DP、
 `require_batches`、参数同步周期和训练步数计算所需的最少 prompt 数；显式检查
 batch 能被 DP 整除且 `TOTAL_ROLLOUT_STEPS` 足够。这样 smoke run 仍只执行一个
 训练步，但不会因为测试配置不合法掩盖 `D2_RUNTIME_RESULT`。这些设置只属于

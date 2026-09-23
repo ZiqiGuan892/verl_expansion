@@ -35,14 +35,14 @@ D2_RUNTIME_SCENARIOS="${D2_RUNTIME_SCENARIOS:-split,fragmented,missing_pg}"
 D2_RUNTIME_LOG_DIR="${D2_RUNTIME_LOG_DIR:-${VERL_REPO_DIR}/logs/d2_runtime}"
 mkdir -p "${D2_RUNTIME_LOG_DIR}"
 
-# 缩短运行步数，但保留 multi_task_run.sh 已验证的 batch=8、rollout.n=2。
+# 缩短运行步数，但保留可被 4 卡 DP 均分的 batch=2、rollout.n=2。
 # 不能把两者都缩为 1：4 个训练 DP rank 至少需要 4 条且可均分的序列。
 # 具体模型、数据和 Ascend/vLLM 环境仍由 multi_task_run.sh 的已有变量控制。
 export TRAIN_TOTAL_EPOCHS="${D2_TRAIN_TOTAL_EPOCHS:-1}"
 export TOTAL_TRAINING_STEPS="${D2_TOTAL_TRAINING_STEPS:-1}"
 export RESPONSES_PER_PROMPT="${D2_RESPONSES_PER_PROMPT:-2}"
 export RESPONSES_PER_PROMPT_VAL="${D2_RESPONSES_PER_PROMPT_VAL:-1}"
-export PPO_MINI_BATCH_SIZE="${D2_PPO_MINI_BATCH_SIZE:-8}"
+export PPO_MINI_BATCH_SIZE="${D2_PPO_MINI_BATCH_SIZE:-2}"
 export ASYNC_TRIGGER_SYNC_STEP="${D2_ASYNC_TRIGGER_SYNC_STEP:-1}"
 export ASYNC_REQUIRE_BATCHES="${D2_ASYNC_REQUIRE_BATCHES:-1}"
 export LOG_DIR="${D2_RUNTIME_LOG_DIR}"
@@ -106,6 +106,13 @@ for scenario in $(printf '%s' "${D2_RUNTIME_SCENARIOS}" | tr ',' ' '); do
 
     set +e
     bash "${SCRIPT_DIR}/multi_task_run.sh" \
+        "actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}" \
+        "actor_rollout_ref.rollout.n=${RESPONSES_PER_PROMPT}" \
+        "async_training.require_batches=${ASYNC_REQUIRE_BATCHES}" \
+        "async_training.trigger_parameter_sync_step=${ASYNC_TRIGGER_SYNC_STEP}" \
+        "trainer.total_training_steps=${TOTAL_TRAINING_STEPS}" \
+        "trainer.total_epochs=${TRAIN_TOTAL_EPOCHS}" \
+        "rollout.total_rollout_steps=${TOTAL_ROLLOUT_STEPS}" \
         "+multitask.d2_runtime_test.enabled=true" \
         "+multitask.d2_runtime_test.scenario=${scenario}" \
         "+multitask.d2_runtime_test.cleanup_after_test=true" \
