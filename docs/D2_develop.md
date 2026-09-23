@@ -311,6 +311,25 @@ Ray 的 placement-group table 中。
 缺少名称的失败路径。修复后的本地结果为 `27 passed`；真实 NPU/vLLM 场景仍需
 重新运行 `D2_runtime_test.sh`。
 
+### 5.5 D2 服务器联调问题：smoke run 的训练 batch 太小
+
+PG 名称问题修复后，`split` 场景已经进入主训练流程，但随后在 native Trainer
+组 batch 时失败：
+
+```text
+AssertionError: number of items:[1] < k_partitions:[4]
+```
+
+这不是 borrowed 创建失败。`D2_runtime_test.sh` 为了缩短训练曾把
+`ppo_mini_batch_size` 和 `rollout.n` 都设成 1，因而只生成 1 条序列；当前
+4 张训练卡的 data-parallel batch 平衡至少需要 4 条可均分的序列。
+
+脚本现恢复为 `ppo_mini_batch_size=8`、`rollout.n=2`，并根据训练 DP、
+`require_batches`、参数同步周期和训练步数计算所需的最少 prompt 数；显式检查
+batch 能被 DP 整除且 `TOTAL_ROLLOUT_STEPS` 足够。这样 smoke run 仍只执行一个
+训练步，但不会因为测试配置不合法掩盖 `D2_RUNTIME_RESULT`。这些设置只属于
+测试脚本，没有修改原生 batch 平衡逻辑。
+
 ## 6. 当前验证记录与限制
 
 - 代码修改范围仅在 `verl-multi-task` 仓库；外层原生 `verl` 未修改。

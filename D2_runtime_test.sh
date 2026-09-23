@@ -16,8 +16,8 @@
 # 多个场景用逗号分隔，例如：
 #   D2_RUNTIME_SCENARIOS=split,fragmented,missing_pg bash ../D2_runtime_test.sh
 #
-# 该阶段只验证 RUNTIME_READY。CE 注册、参数 bootstrap、LB 接流和业务请求
-# 均不会执行。
+# borrowed 只验证到 RUNTIME_READY，不执行其 CE 注册、bootstrap 或 LB 接流。
+# 测试 hook 返回后主入口仍会执行 native rollout/训练，所以训练 batch 必须合法。
 set -eu
 set -x
 
@@ -35,17 +35,44 @@ D2_RUNTIME_SCENARIOS="${D2_RUNTIME_SCENARIOS:-split,fragmented,missing_pg}"
 D2_RUNTIME_LOG_DIR="${D2_RUNTIME_LOG_DIR:-${VERL_REPO_DIR}/logs/d2_runtime}"
 mkdir -p "${D2_RUNTIME_LOG_DIR}"
 
-# 一次 smoke run 只需要初始化和一个最小训练步骤。具体模型、数据和
-# Ascend/vLLM 环境仍由 multi_task_run.sh 的已有变量控制。
+# 缩短运行步数，但保留 multi_task_run.sh 已验证的 batch=8、rollout.n=2。
+# 不能把两者都缩为 1：4 个训练 DP rank 至少需要 4 条且可均分的序列。
+# 具体模型、数据和 Ascend/vLLM 环境仍由 multi_task_run.sh 的已有变量控制。
 export TRAIN_TOTAL_EPOCHS="${D2_TRAIN_TOTAL_EPOCHS:-1}"
 export TOTAL_TRAINING_STEPS="${D2_TOTAL_TRAINING_STEPS:-1}"
-export TOTAL_ROLLOUT_STEPS="${D2_TOTAL_ROLLOUT_STEPS:-1}"
-export RESPONSES_PER_PROMPT="${D2_RESPONSES_PER_PROMPT:-1}"
+export RESPONSES_PER_PROMPT="${D2_RESPONSES_PER_PROMPT:-2}"
 export RESPONSES_PER_PROMPT_VAL="${D2_RESPONSES_PER_PROMPT_VAL:-1}"
-export PPO_MINI_BATCH_SIZE="${D2_PPO_MINI_BATCH_SIZE:-1}"
+export PPO_MINI_BATCH_SIZE="${D2_PPO_MINI_BATCH_SIZE:-8}"
 export ASYNC_TRIGGER_SYNC_STEP="${D2_ASYNC_TRIGGER_SYNC_STEP:-1}"
 export ASYNC_REQUIRE_BATCHES="${D2_ASYNC_REQUIRE_BATCHES:-1}"
 export LOG_DIR="${D2_RUNTIME_LOG_DIR}"
+
+# 此检查对应 multi_task_run.sh 的 FSDP2 配置：训练卡数就是 DP 数。
+export TRAIN_NODES="${TRAIN_NODES:-1}"
+export TRAIN_NPUS_PER_NODE="${TRAIN_NPUS_PER_NODE:-4}"
+for count in "${PPO_MINI_BATCH_SIZE}" "${RESPONSES_PER_PROMPT}" "${ASYNC_REQUIRE_BATCHES}" \
+    "${ASYNC_TRIGGER_SYNC_STEP}" "${TOTAL_TRAINING_STEPS}" "${TRAIN_NODES}" "${TRAIN_NPUS_PER_NODE}"; do
+    if ! [ "${count}" -gt 0 ] 2>/dev/null; then
+        echo "D2 的 batch、响应数、步数和训练卡数必须是正整数，实际值：${count}" >&2
+        exit 1
+    fi
+done
+D2_TRAIN_DP_SIZE=$((TRAIN_NODES * TRAIN_NPUS_PER_NODE))
+D2_MINIBATCH_SEQUENCES=$((PPO_MINI_BATCH_SIZE * RESPONSES_PER_PROMPT))
+if [ "${D2_MINIBATCH_SEQUENCES}" -lt "${D2_TRAIN_DP_SIZE}" ] || \
+    [ "$((D2_MINIBATCH_SEQUENCES % D2_TRAIN_DP_SIZE))" -ne 0 ]; then
+    echo "D2 batch 配置错误：mini_batch*n=${D2_MINIBATCH_SEQUENCES} 必须 >= DP=${D2_TRAIN_DP_SIZE} 且能被整除。" >&2
+    exit 1
+fi
+
+# FullyAsync 队列按 prompt 计数，一条 RolloutSample 含 n 条响应。
+# 每次训练收集 mini_batch*require_batches 个 prompt；同步周期还包含 trigger 个训练步。
+D2_REQUIRED_PROMPTS=$((PPO_MINI_BATCH_SIZE * ASYNC_REQUIRE_BATCHES * ASYNC_TRIGGER_SYNC_STEP * TOTAL_TRAINING_STEPS))
+export TOTAL_ROLLOUT_STEPS="${D2_TOTAL_ROLLOUT_STEPS:-${D2_REQUIRED_PROMPTS}}"
+if ! [ "${TOTAL_ROLLOUT_STEPS}" -ge "${D2_REQUIRED_PROMPTS}" ] 2>/dev/null; then
+    echo "D2_TOTAL_ROLLOUT_STEPS=${TOTAL_ROLLOUT_STEPS} 不足，至少需要 ${D2_REQUIRED_PROMPTS} 个 prompt。" >&2
+    exit 1
+fi
 
 case "${D2_RUNTIME_SCENARIOS}" in
     *[!a-zA-Z0-9_,]*)
