@@ -272,6 +272,24 @@ export MT_GPU_TEST_CONFIG=/absolute/path/to/d0-gpu-test-config.json
 
 **D00 通过标准：** U 层测试和配置检查通过；真实 native 配置在启用/关闭 profile 下均能完成初始化、生成及至少一次后续参数同步；结果和版本证据已归档，并由用户明确确认 D00 通过。当前仅完成开发和静态检查，因缺少 Python、GPU 和真实训练环境，D01 不得开始。
 
+### 生命周期边界调整：仅保留 CE suspend/resume 必要步骤
+
+**状态：代码调整完成，真实环境待后续 lifecycle 开发者验收。** 本次根据“sleep/wake 由其他开发者实现”的约束，未实现新的 server sleep/wake、请求摘流、LB、通信域销毁/重建或 reclaim/destroy 逻辑。
+
+**修改文件与目的：**
+
+| 文件 | 修改内容 | 目的 |
+| --- | --- | --- |
+| `src/multi_task_scheduler/checkpoint/checkpoint_engine_manager.py` | 补充 `suspend_replicas_for_sync()`、`resume_replicas_for_sync()` 的职责边界和生产顺序 TODO | 明确这两个方法只维护 CE effective set，不能被误用为完整 sleep/wake |
+| `src/multi_task_scheduler/integration/verl/experimental_fully_async/llm_server_manager.py` | 标明 D3 显存 helper、donor 唤醒和 `set_global_steps()` 为测试夹具；记录生产 wake 顺序 TODO | 防止测试内存释放/版本元数据被当作真实生命周期或参数同步 |
+| `src/multi_task_scheduler/integration/verl/experimental_fully_async/trainer.py` | 标明当前 smoke 的 suspend/resume 顺序是测试顺序，记录生产 gate、CE finalize、server sleep/wake 和 LB 提交流程 TODO | 保留现有 D3 验证，同时给后续 lifecycle 实现明确接入点 |
+| `src/multi_task_scheduler/rollout/http_server.py` | 将 `sleep_for_runtime_test()` / `wake_for_runtime_test()` 限定为测试 helper，并补充生产接口 TODO | 避免扩展类提前承担其他开发者负责的 sleep/wake 行为 |
+| `docs/D3_develop.md` | 增加生命周期边界和生产顺序 | 让代码、测试和架构约束一致 |
+
+**当前实现的必要行为：** donor rank 被加入 `suspended_replica_ranks` 后，下一次普通 CE 同步只使用 borrower/native 的其余 effective replica；借用窗口结束后清除该标记。真实 server sleep/wake 和参数追平没有被宣称为已实现。
+
+**验证计划：** 运行现有无 GPU 单元测试，重点检查 CE effective-set 排除/恢复、borrowed bootstrap 和原有 wiring；真实 GPU 验收仍需由后续 lifecycle 实现完成。当前 D3 smoke 中的顺序只用于释放显存并验证 HCCL 重复设备问题，不能替代生产生命周期验收。
+
 ```
 "multitask.runtime.profile=experimental_fully_async_standalone"
 ```

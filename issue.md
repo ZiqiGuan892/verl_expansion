@@ -421,8 +421,60 @@ borrowed。donor 随后被唤醒继续生成，但它被排除在本轮 CE 同�
 的 `global_steps` 仍然是初始化值 `None`。生成结果携带空参数版本，batch 组装时执行
 `None - None` 失败。
 
-### 修复
+### D3 测试路径修复
 
 `cleanup_d3_runtime()` 增加可选的 `global_steps` 参数。Trainer 清理 borrowed、唤醒 donor
 后，显式调用继承自原生 server 的 `set_global_steps(global_steps)`，使 donor 生成结果
-带上当前参数版本。该修复只补齐 D3 测试交接路径，不修改原生 verl 的 batch 逻辑。
+带上当前参数版本。该操作只补齐 D3 测试交接路径中的版本元数据，不更新 donor 的模型权重，
+不能替代真实的 target-only 参数同步；不修改原生 verl 的 batch 逻辑。
+
+## 10. donor sleep/wake 与 CE membership 的职责边界
+
+### 背景
+
+前述 D3 修复曾经容易被理解为已经实现了完整的 donor sleep/wake 生命周期。当前设计已经
+明确收窄：sleep 和 wake 由后续 lifecycle 开发负责，本插件当前只实现 CE effective-set 的
+必要切换。
+
+### 当前实现
+
+`MultiTaskCheckpointEngineManager` 提供：
+
+```text
+suspend_replicas_for_sync(replica_ranks)
+resume_replicas_for_sync(replica_ranks)
+```
+
+Trainer 通过以下窄接口调用它们：
+
+```text
+suspend_donors_for_borrow(replica_ranks)
+resume_donors_after_borrow(replica_ranks)
+```
+
+前者把 donor rank 从后续 CE effective snapshot 排除，避免 donor CE Worker 与 borrowed CE
+Worker 在同一物理设备上同时进入 HCCL 通信域；后者在 donor 已完成恢复和追平后重新允许其
+参加同步。这些方法不创建/销毁 Worker，不操作 vLLM engine，不修改 LB 路由，也不负责旧
+通信域 finalize。
+
+`sleep_for_runtime_test()`、`wake_for_runtime_test()` 和 `set_global_steps()` 仍然只用于
+D2/D3 smoke：前两者用于测试显存交接，后者只恢复测试结果中的版本字段。它们不是生产
+sleep/wake 接口，也不能保证 donor 的权重已经追平。
+
+### 后续 lifecycle 实现必须补齐的顺序
+
+```text
+CE suspend + 旧域 finalize
+  -> drain/abort 请求并从 LB 摘流
+  -> donor server sleep
+  -> borrowed 创建/使用
+  -> borrowed drain/remove/destroy
+  -> donor server wake
+  -> target-only CE 参数同步到当前 actor version + finalize
+  -> CE resume
+  -> LB READY
+```
+
+上述真实 server 操作、in-flight 请求处理、通信域清理/重建、参数追平和 reclaim/destroy
+均在当前代码中保留为 `TODO(lifecycle)`，由其他开发者实现。D3 smoke 当前先使用测试
+sleep 释放显存，再由 Trainer 更新 CE 投影；该顺序仅用于测试，不是生产事务顺序。

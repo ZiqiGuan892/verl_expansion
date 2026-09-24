@@ -81,6 +81,13 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         have entered Engine sleep.  Leaving donor CE workers in the HCCL
         topology would create duplicate ranks on the borrowed physical
         devices and causes HCCL ``parameter error`` during communicator init.
+
+        The method changes only the manager's effective-replica projection.
+        It deliberately does not drain requests, update LB routing, sleep a
+        vLLM server, or finalize an already-built communication domain.
+        TODO(lifecycle): the production owner must perform those operations
+        before the donor is reused by a borrowed replica, then call this
+        method while holding the same lifecycle/synchronization boundary.
         """
         ranks = self._normalize_replica_ranks(replica_ranks)
         async with self.sync_gate:
@@ -92,7 +99,16 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             return {"state": "SUSPENDED", "replica_ranks": sorted(ranks)}
 
     async def resume_replicas_for_sync(self, replica_ranks) -> dict:
-        """Allow previously suspended donor ranks into future CE snapshots."""
+        """Allow previously suspended donor ranks into future CE snapshots.
+
+        This is only the final CE membership step.  The caller must first
+        wake the donor, synchronize it to the current actor version with a
+        target-only CE transaction, and finalize that temporary communication
+        domain.  This method does not perform any of those operations.
+        TODO(lifecycle): enforce a production wake/target-sync receipt before
+        removing a rank from ``suspended_replica_ranks``.  The D3 smoke keeps
+        the weaker behavior so its test fixture remains runnable.
+        """
         ranks = self._normalize_replica_ranks(replica_ranks)
         async with self.sync_gate:
             self.suspended_replica_ranks.difference_update(ranks)

@@ -91,7 +91,12 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
 
     @staticmethod
     async def _test_memory_call(replica, method: str, *args) -> None:
-        """Call an opt-in runtime fixture on every node of one test replica."""
+        """Call an opt-in runtime fixture on every node of one test replica.
+
+        These calls are D2/D3 smoke-test helpers, not lifecycle operations.
+        Production sleep/wake must be supplied by the lifecycle owner and
+        coordinated with CE membership and request routing.
+        """
         await asyncio.gather(*(getattr(server, method).remote(*args) for server in replica.servers))
 
     async def get_replica_for_ce(self, replica_rank: int):
@@ -130,6 +135,12 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         await self._test_memory_call(replica, "sleep_for_runtime_test")
         cleanup = await replica._cleanup_runtime()
         for donor in record.get("sleeping_donors", []):
+            # Test-only wake.  The production order is wake -> target-only CE
+            # sync/finalize to the current actor version -> resume the donor
+            # in the CE effective set -> LB commit.  The CE Manager is owned
+            # by Trainer, so this manager cannot perform that transaction.
+            # TODO(lifecycle): replace this fixture path with an owner-side
+            # wake receipt and target-only parameter synchronization.
             await self._test_memory_call(donor, "wake_for_runtime_test")
             if global_steps is not None:
                 # Donors were excluded from the CE topology while the
@@ -697,6 +708,11 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             # The local smoke donor owns the same physical NPU claimed by the
             # borrower. Its standalone server must offload weights first;
             # Ray's fractional GPU accounting does not provide memory isolation.
+            # TODO(lifecycle): production orchestration must suspend the donor
+            # from the CE effective set (and finalize its old domain) before
+            # draining and sleeping the server. This D2/D3 fixture performs
+            # only the memory operation here; Trainer applies the CE
+            # projection change after the borrowed runtime is prepared.
             sleeping_donors = self._local_native_donors(spec)
             for donor in sleeping_donors:
                 await self._test_memory_call(donor, "sleep_for_runtime_test")

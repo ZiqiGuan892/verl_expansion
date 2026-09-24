@@ -16,6 +16,10 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
         Level 1 copies weights to CPU and discards KV cache, releasing both
         device allocations while preserving weights for wake-up. This is only
         called by startup tests before generation, not a production drain API.
+
+        TODO(lifecycle): the production sleep hook is owned by the lifecycle
+        implementation. It must drain/abort requests and coordinate LB and CE
+        membership before invoking an engine sleep operation.
         """
         if self.node_rank != 0:
             return
@@ -23,7 +27,10 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
         await self.engine.sleep(level=1)
 
     async def wake_for_runtime_test(self) -> None:
-        """Restore the donor's saved weights and cache before native training."""
+        """Restore the donor's saved weights and cache for a smoke test.
+
+        This helper is intentionally not the production wake operation.
+        """
         if self.node_rank != 0:
             return
         self._require_test_sleep_mode()

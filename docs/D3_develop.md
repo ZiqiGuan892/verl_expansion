@@ -271,3 +271,37 @@ D3_RUNTIME_SCENARIOS=basic bash ../D3_test.sh
 `global_steps`。D3 清理阶段在唤醒 donor 后显式调用 `set_global_steps(current_param_version)`；
 否则下一次生成返回的版本字段为 `None`，会在 `detach_utils.py` 的 batch 组装阶段触发
 `None - None`。
+
+### 5.4 本次调整后的生命周期边界
+
+本次只保留两项必要的 CE 步骤：
+
+1. donor 进入借用窗口时，`MultiTaskCheckpointEngineManager.suspend_replicas_for_sync()`
+   将 donor rank 从 effective set 排除，避免 donor CE Worker 和 borrowed CE Worker 在同一
+   物理设备上共同加入下一次 HCCL 通信域；
+2. 借用窗口结束且 donor 已经完成恢复与追平后，
+   `resume_replicas_for_sync()` 清除排除标记，使 donor 能够参加后续同步。
+
+Trainer 对这两个 CE 操作提供了 `suspend_donors_for_borrow(replica_ranks)` 和
+`resume_donors_after_borrow(replica_ranks)` 两个窄接口，供后续 lifecycle 编排调用；它们
+只转发 CE effective-set 变更，不持有或操作 server、LB、engine 句柄。
+
+真实的请求摘流、in-flight 请求处理、LB 路由提交、vLLM server sleep/wake、旧通信域
+finalize/重建、最新参数的 target-only 同步以及 reclaim/destroy 均由后续 lifecycle 实现负责，
+当前代码只在相应位置保留 `TODO(lifecycle)`。`sleep_for_runtime_test()`、
+`wake_for_runtime_test()` 和 `set_global_steps()` 仅是 D3 显存/版本字段测试夹具，不能作为生产
+生命周期接口或真实参数同步的替代品。
+
+生产顺序必须遵守：
+
+```text
+CE suspend + 旧域 finalize
+  -> drain/LB remove
+  -> server sleep
+  -> borrowed 创建与使用
+  -> borrowed drain/remove/destroy
+  -> server wake
+  -> target-only CE sync 到当前 actor version + finalize
+  -> CE resume
+  -> LB READY
+```

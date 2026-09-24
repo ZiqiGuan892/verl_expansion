@@ -67,6 +67,28 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
         replica = await self.rollouter.get_borrowed_replica_for_ce.remote(replica_rank)
         return await self.checkpoint_manager.unregister_replica(replica)
 
+    async def suspend_donors_for_borrow(self, replica_ranks) -> dict:
+        """Remove donor ranks from CE effective membership for a borrow window.
+
+        This is the CE-side hook for an externally-owned donor sleep
+        transaction. It does not drain requests, change LB routing, sleep a
+        vLLM server, or finalize an existing communication domain.
+        """
+        # TODO(lifecycle): call this before donor sleep and require the old CE
+        # domain to be finalized before borrower creation.
+        return await self.checkpoint_manager.suspend_replicas_for_sync(replica_ranks)
+
+    async def resume_donors_after_borrow(self, replica_ranks) -> dict:
+        """Re-enable donor CE membership after an externally-owned wake.
+
+        The caller must already have completed server wake, target-only
+        synchronization to the current actor version, and communication-domain
+        finalization. No server or parameter operation is performed here.
+        """
+        # TODO(lifecycle): require and validate the wake/target-sync receipt
+        # before making the donor effective again.
+        return await self.checkpoint_manager.resume_replicas_for_sync(replica_ranks)
+
     async def load_checkpoint(self):
         """Load native checkpoints, then optionally run the D3 bootstrap hook."""
         result = await super().load_checkpoint()
@@ -91,7 +113,13 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
             registered = registration.get("state") in {"REGISTERED", "ALREADY_REGISTERED"}
             bootstrap = await self.bootstrap_replica(replica_rank)
             donor_ranks = [int(rank) for rank in prepared.get("sleeping_donor_ranks", [])]
-            memory = await self.checkpoint_manager.suspend_replicas_for_sync(donor_ranks)
+            # The smoke fixture already slept donors to make device memory
+            # available.  The only lifecycle step implemented here is the CE
+            # projection change that prevents duplicate HCCL devices.
+            # TODO(lifecycle): production TaskRunner ordering must be
+            # lifecycle gate -> CE suspend/finalize -> drain/LB removal ->
+            # server sleep -> borrowed creation. Do not copy this test order.
+            memory = await self.suspend_donors_for_borrow(donor_ranks)
             memory.update(
                 {
                     "replica_rank": replica_rank,
@@ -117,7 +145,7 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
                     pass
             if self._d3_suspended_donor_ranks:
                 try:
-                    await self.checkpoint_manager.resume_replicas_for_sync(self._d3_suspended_donor_ranks)
+                    await self.resume_donors_after_borrow(self._d3_suspended_donor_ranks)
                 except Exception:
                     pass
                 self._d3_suspended_donor_ranks = []
@@ -155,8 +183,12 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
                 raise RuntimeError(f"D3 full sync did not update borrowed replica: {full_sync}")
             if self._d3_cleanup_after_test:
                 await self.unregister_replica(rank)
+                # cleanup_d3_runtime is a test fixture: it wakes the donor and
+                # restores only version metadata. Production wake must first
+                # run target-only CE synchronization/finalize, then resume
+                # the donor in the effective set and finally publish LB READY.
                 cleanup = await self.rollouter.cleanup_d3_runtime.remote(rank, self.current_param_version)
-                await self.checkpoint_manager.resume_replicas_for_sync(self._d3_suspended_donor_ranks)
+                await self.resume_donors_after_borrow(self._d3_suspended_donor_ranks)
                 self._d3_bootstrap_result["cleanup"] = cleanup
                 self._d3_suspended_donor_ranks = []
             self._d3_bootstrap_rank = None
