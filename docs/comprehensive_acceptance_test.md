@@ -198,11 +198,11 @@ READY 前调用 acquire_server，必须失败或看不到新 borrowed server。R
 | S2 | 一拆二 | donor 4 卡；创建两个 world_size=2 borrowed | 两个 lease/rank/server 独立；claim 不重叠；分别 bootstrap 和生成 | 当前 D2 smoke 未覆盖两个 borrower 同时创建 |
 | S3 | 二合一 | 两个 world_size=2 donor PG；一个 world_size=4 borrower | 跨 PG rank 重新编号；四 Worker、一个 engine 拓扑一致 | 当前 cross_pg 只选少量 claim，不能代替 |
 | S4 | 碎片化 bundle | 同一/多个 PG 选择非连续 bundle，如 1、3、0、2 | 实际 bundle 与 claim 逐条匹配 | 有 D2 证据，需接入 CE/LB/生成 |
-| S5 | 多 Worker 共 bundle | max_colocate_count 大于 2，多个 fractional claim | 先验证 Ray/CE placement，再核验显存 | 需 CE-only 或足够显存配置 |
+| S5 | 多 Worker 共 bundle | 同一 PG/bundle 上两个 fractional borrower claim，donor engine 休眠后串行创建 | 验证多个 CE Worker 可以复用同一 bundle 的 fractional slot；每个 runtime 单独清理；不同时加入 HCCL effective set | 已加入 `D4_test.sh shared_bundle`；当前只给 placement/清理证据，不宣称同时接流 |
 | S6 | 跨节点均匀 | 每节点相同 Worker 数 | node/local rank、server 分组、通信域 | 单机 8 卡不能证明 |
-| S7 | 异构 world_size | donor 4→borrower 2，donor 2+2→borrower 4 | donor rank 不复用，borrower rank 连续 | 当前只验证部分拆分 |
-| S8 | 同 lease 重试 | 相同 spec、相同 lease、重复 RPC | 一个 runtime、同一 receipt | 有 D1 单元，需真实 Ray 重复 RPC |
-| S9 | 并发重复 | 多线程或多 Ray caller 同时提交同 lease | 一个 rank、一个 Worker/engine 集合 | 当前没有真实 Ray 并发验收 |
+| S7 | 异构 world_size | 两个 TP=2 native donor 的 claims 合并为一个 TP=4 borrower | donor rank 不复用，borrower rank 连续，跨 PG claims 的实际 device 一一对应 | 已加入 `D4_test.sh merge_world_size`；仍缺真实生成/同步 |
+| S8 | 同 lease 重试 | 相同 spec、相同 lease，TaskRunner 连续发出两次 create RPC | 一个 runtime、同一 rank/server/Worker 集合，第二次只返回已有 receipt | 已加入 `D4_test.sh idempotent`；阶段证据，仍缺生成验收 |
+| S9 | 并发重复 | TaskRunner 内两个并发调用同时提交同 lease | 一个 rank、一个 Worker/engine 集合，锁和 lease 幂等共同生效 | 已加入 `D4_test.sh concurrent_idempotent`；阶段证据，仍缺压力/生成验收 |
 | S10 | lease 冲突/过期 | 相同 lease 不同 spec；expired lease | 创建前拒绝，无 Actor/PG 副作用 | 有契约单测，需真实入口 |
 | S11 | PG/设备错误 | missing PG、duplicate device、错误 node/GPU | 不 READY；donor 不受损；清理可确认 | D2 负例部分覆盖 |
 | S12 | Worker/engine 局部失败 | Worker 失败、OOM、端口冲突或超时 | 不发布 LB；清除部分资源；donor 恢复 | 当前缺少完整故障注入 |
@@ -222,11 +222,11 @@ READY 前调用 acquire_server，必须失败或看不到新 borrowed server。R
 | S2 | 与 S1 相同，但 `_build_d2_test_spec("split")` 只取一个 donor 的部分 claims，创建一个 world_size=2 的 borrowed replica。 | **可执行但不完整**。验证了 4 卡 donor → 2 卡 borrower 的部分拆分；没有验证一个 donor 同时拆成两个 borrower。 |
 | S3 | `D4_test.sh cross_pg` 将 rollout TP 调为 2，先创建两个较小的 native PG，再从不同 PG 各取一个 claim，重编号后创建一个跨 PG borrowed runtime，执行 CE bootstrap、LB_READY、endpoint 检查和测试清理。 | **可执行但不完整**。验证了跨 PG claim；当前并不是两个 world_size=2 donor 合成为一个 world_size=4 borrower。 |
 | S4 | 与 S1 相同，但选择 `source_claims[::2]` 形成非连续 bundle，随后执行真实 Worker/Server/Engine 创建、CE bootstrap、LB_READY、endpoint 检查和测试清理。 | **可执行但不完整**。可以验证单个碎片化 placement；缺少真实生成和后续普通同步。 |
-| S5 | 当前综合脚本没有创建入口；代码中只有 `max_colocate_count`/fractional placement 约束，未建立多个同 bundle CE Worker 的真实 HCCL 切换测试。 | **不可直接执行**。同卡多 Engine 还受显存和 HCCL 单物理设备单 active rank 约束，不能仅凭 Ray placement 判定通过。 |
+| S5 | `D4_test.sh shared_bundle`；native donor 初始化 → 读取同一 bundle claim → donor engine 测试休眠 → 以较小 fractional GPU/CPU claim 创建 borrower A → 休眠 A → 在相同 bundle 创建 borrower B → 分别 kill/清理 A、B → 唤醒 donor。该路径只创建/校验 CE Worker 和 runtime placement，不注册 CE、不创建 LB 路由。 | **可执行但不完整**。可以在 1 节点 8 卡上验证 Ray fractional placement 和清理隔离；由于 HCCL 校验每个物理 bundle 只能有一个 active CE member，且同卡多 vLLM engine 会触发显存竞争，不能把同时接流作为通过条件。 |
 | S6 | 当前没有跨节点启动器或多节点资源配置；不能进入真实多节点 PG、node rank 和 HCCL 通信域验证。 | **不可执行**。当前只有 1 个节点。 |
-| S7 | S2 可部分覆盖 4→2，S3 可部分覆盖跨 PG claim，但综合脚本没有独立的异构 world_size 场景，也没有完整 2+2→4 组合。 | **只能部分执行**，不能作为异构 world_size 完整验收。 |
-| S8 | 综合脚本调用 `D2_test.sh` 的契约单元测试，检查相同 lease/spec 的幂等字段和 receipt 行为；不启动真实 borrowed runtime。 | **只能单元测试**。真实 Ray 重试、同一 lease 只保留一组 Worker/Engine 的验证尚未接入。 |
-| S9 | 综合脚本同样只调用 D2/D1 单元测试；没有两个真实 Ray caller 并发调用 TaskRunner 的 harness。 | **只能单元测试**。真实并发 duplicate create 尚不能验证。 |
+| S7 | `D4_test.sh merge_world_size` 将 rollout TP 设为 2，收集两个 native donor 的全部 claims，合并成 world_size=4 spec，执行 borrowed CE/HTTP/Engine 创建、CE bootstrap、LB_READY、endpoint 检查和清理。 | **可执行但不完整**。可以在单机上验证 2+2→4 的 rank/device 构造；没有真实生成和后续普通同步。 |
+| S8 | `D4_test.sh idempotent`；第一次 create 完成 CE bootstrap/LB_READY，第二次以完全相同 lease/spec 发送 create，核对返回相同 rank/server 和单一 Worker/Engine 快照，然后只清理一次。 | **可执行但不完整**。真实 Ray 重试路径可执行；仍缺生成期间的请求幂等和参数同步验收。 |
+| S9 | `D4_test.sh concurrent_idempotent`；同一个 TaskRunner 用两个线程同时调用 create，内部操作锁和 manager lease 幂等保证只执行一次实际创建；核对两个 receipt、rank/server 和 runtime 快照，再清理一次。 | **可执行但不完整**。可以验证真实 Actor 内并发 duplicate create；不能替代跨任务 GS 并发和请求压力测试。 |
 | S10 | `D2_runtime_test.sh expired`；native 初始化 → 构造已过期 spec → 在创建 Worker 前被 placement/lease 校验拒绝 → 输出 `EXPECTED_FAILURE` → 主训练流程继续并清理 native 资源。 | **可直接执行**。可以验证 expired lease 不进入 `RUNTIME_READY`；不能替代完整 lease 冲突重试测试。 |
 | S11 | `D2_runtime_test.sh missing_pg,duplicate_device`；native 初始化 → 构造缺失 PG 或重复设备的 spec → 创建前校验失败 → 输出预期失败 receipt → 检查没有发布 borrowed runtime。 | **可直接执行**。可以验证两类 placement 负例；Worker 中途失败、OOM、端口冲突仍没有真实注入。 |
 | S12 | 当前没有第 N 个 Worker 失败、Engine OOM、端口冲突或启动超时的可控注入参数。 | **不可执行**。不能用一次自然 OOM 代替可重复的故障验收。 |
@@ -235,7 +235,7 @@ READY 前调用 acquire_server，必须失败或看不到新 borrowed server。R
 | S15 | 当前 D4 smoke 的 donor 和 borrower 都属于同一个 TaskRunner/LLMServerManager；没有两个独立任务、GS 授权快照和跨任务 RPC 启动器。 | **不可执行**。不能证明 borrower 不持有 donor 句柄或跨任务继续运行。 |
 | S16 | D4 只调用 `get_server_address` 和 `get_all_servers` 检查 endpoint/LB 名录，没有通过客户端发送 prompt，也没有并发请求驱动器。 | **不可执行**。不能验证真实样本、inflight 计数、sticky 路由或压力下的释放。 |
 
-因此，当前机器上可以逐个直接运行 `S0、S1、S2、S3、S4、S10、S11`；其中 S1–S4 是阶段链路验证，严格综合验收仍应标记为 `INCOMPLETE`。S8、S9 只能得到单元测试证据，S5、S6、S12–S16 不能在当前实现和硬件条件下直接完成综合验收。
+因此，当前机器上可以逐个直接运行 `S0、S1、S2、S3、S4、S5、S7、S8、S9、S10、S11`；其中 S1–S5、S7–S9 是阶段链路或资源约束验证，严格综合验收仍应标记为 `INCOMPLETE`。S6、S12–S16 不能在当前实现和硬件条件下直接完成综合验收。
 
 ## 6. 故障注入与不变量
 
@@ -294,7 +294,10 @@ stderr.log
 | S2 | `D4_test.sh split` | 只创建一个拆分后的 borrower，尚未验证两个 borrower 同时存在，为 `INCOMPLETE` |
 | S3 | `D4_test.sh cross_pg` | 当前只验证跨 PG claim，尚未验证 2+2 合成 world_size=4，为 `INCOMPLETE` |
 | S4 | `D4_test.sh fragmented` | placement 和 runtime 路径可执行，但缺少真实 generate/后续 sync，为 `INCOMPLETE` |
-| S8、S9 | `D2_test.sh` 契约单元测试 | 只有单元证据，真实重试/并发 RPC 未实现，为 `INCOMPLETE` |
+| S5 | `D4_test.sh shared_bundle` | 同 bundle fractional CE placement/清理可执行；HCCL/LB 同时接流受约束，为 `INCOMPLETE` |
+| S7 | `D4_test.sh merge_world_size` | 2+2→4 合并路径可执行，但缺真实 generate/后续 sync，为 `INCOMPLETE` |
+| S8 | `D4_test.sh idempotent` | 真实 Ray 重试只保留一个 runtime，为 `INCOMPLETE` |
+| S9 | `D4_test.sh concurrent_idempotent` | 真实 TaskRunner 并发重复只保留一个 runtime，为 `INCOMPLETE` |
 | S10 | `D2_runtime_test.sh expired` | 预期拒绝且无 READY 才为 `PASS` |
 | S11 | `D2_runtime_test.sh missing_pg,duplicate_device` | placement 负例均按预期失败才为 `PASS` |
 | S12、S13、S14、S16 | 暂无真实故障注入或请求压力入口 | `BLOCKED` |
@@ -316,13 +319,19 @@ D2_RUNTIME_SCENARIOS=basic,split,fragmented,cross_pg bash ../D2_runtime_test.sh
 D3_RUNTIME_SCENARIOS=basic,split,fragmented,cross_pg bash ../D3_test.sh
 D4_RUNTIME_SCENARIOS=basic,split,fragmented,cross_pg bash ../D4_test.sh
 
+# D4 资源边界和 lease 幂等场景
+D4_RUNTIME_SCENARIOS=shared_bundle bash ../D4_test.sh
+D4_RUNTIME_SCENARIOS=merge_world_size bash ../D4_test.sh
+D4_RUNTIME_SCENARIOS=idempotent bash ../D4_test.sh
+D4_RUNTIME_SCENARIOS=concurrent_idempotent bash ../D4_test.sh
+
 # 综合脚本：每次只运行一个场景
 D0_D4_SCENARIOS=S0 bash ../D0_D4_comprehensive_test.sh
 D0_D4_SCENARIOS=S1 bash ../D0_D4_comprehensive_test.sh
 D0_D4_SCENARIOS=S10 bash ../D0_D4_comprehensive_test.sh
 
 # 如果需要批量运行，必须由外层 shell 逐次启动，每个场景都有独立进程和日志
-for scenario in S0 S1 S2 S3 S4 S10 S11; do
+for scenario in S0 S1 S2 S3 S4 S5 S7 S8 S9 S10 S11; do
   D0_D4_SCENARIOS="${scenario}" bash ../D0_D4_comprehensive_test.sh || exit $?
 done
 

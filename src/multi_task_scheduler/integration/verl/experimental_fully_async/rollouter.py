@@ -111,6 +111,14 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
         """Verify the borrowed primary endpoint is present in the LB route table."""
         return await self.llm_server_manager.probe_replica_ready(replica_rank)
 
+    async def test_operation_snapshot(self, lease_id: str) -> dict:
+        """Return the test-only idempotency projection without exposing handles."""
+        return await self.llm_server_manager.test_operation_snapshot(lease_id)
+
+    async def run_d4_shared_bundle_smoke(self) -> dict:
+        """Run the opt-in same-bundle placement fixture owned by the manager."""
+        return await self.llm_server_manager.run_d4_shared_bundle_smoke()
+
     async def cleanup_d4_runtime(self, replica_rank: int) -> dict:
         """Run test-only route removal and actor cleanup after D4 smoke."""
         return await self.llm_server_manager.cleanup_d4_runtime(replica_rank)

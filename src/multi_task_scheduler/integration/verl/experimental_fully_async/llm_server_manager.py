@@ -257,6 +257,31 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             "registered": True,
         }
 
+    async def test_operation_snapshot(self, lease_id: str) -> dict:
+        """Return serializable state for opt-in idempotency smoke tests.
+
+        The production API intentionally does not expose actor handles or
+        internal operation records.  D4's idempotency/concurrency scenarios
+        need to prove that a repeated request did not create a second runtime,
+        so this test-only projection reports counts and stable names only.
+        """
+        if not isinstance(lease_id, str) or not lease_id:
+            raise ValueError("lease_id must be a non-empty string")
+        record = self.borrowed_operations.get(lease_id)
+        if record is None:
+            raise KeyError(f"unknown borrower lease_id: {lease_id}")
+        replica = record.get("replica")
+        return {
+            "lease_id": lease_id,
+            "operation_id": record.get("operation_id"),
+            "state": record.get("state"),
+            "replica_rank": record.get("replica_rank"),
+            "server_id": record.get("lb_server_id"),
+            "worker_count": len(getattr(replica, "workers", [])) if replica is not None else 0,
+            "server_count": len(getattr(replica, "servers", [])) if replica is not None else 0,
+            "created_actor_names": list(record.get("created_actor_names", [])),
+        }
+
     async def cleanup_d3_runtime(self, replica_rank: int, global_steps: int | None = None) -> dict:
         """Clean only the temporary D3 borrowed actors after CE checks."""
         record = self._borrowed_record_by_rank(replica_rank)
@@ -796,6 +821,13 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             if len(snapshots) < 2:
                 raise RuntimeError("cross_pg scenario needs at least two native replicas/PGs")
             selected = [snapshots[0][0], snapshots[1][0]]
+        elif scenario == "merge_world_size":
+            if len(snapshots) < 2:
+                raise RuntimeError("merge_world_size scenario needs at least two native replicas/PGs")
+            # D4 starts two TP=2 native replicas.  The borrower consumes all
+            # four real claims, proving that its world size may be larger than
+            # either donor and that claims can span PGs.
+            selected = [claim for snapshot in snapshots for claim in snapshot]
         elif scenario in {"missing_pg", "duplicate_device", "expired"}:
             if len(source_claims) < 2:
                 raise RuntimeError(f"{scenario} scenario needs at least two native workers")
@@ -833,6 +865,141 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         if scenario == "expired":
             spec["expires_at"] = time.time() - 1.0
         return spec, expected_failure
+
+    async def _build_shared_bundle_test_specs(self) -> list[dict]:
+        """Build two one-worker specs that intentionally share one bundle.
+
+        This fixture is isolated from normal D2/D3/D4 paths.  Each borrowed
+        CE worker requests 0.25 GPU and 0.5 CPU, so the native donor (0.5 GPU
+        and one CPU) plus both test workers fit one bundle when M=2.  The
+        first borrowed vLLM server is put to sleep before the second starts;
+        this keeps NPU memory and HCCL membership safe while still proving
+        Ray can place multiple independent workers on the same donor slot.
+        """
+        native_replicas = list(getattr(self, "rollout_replicas", []))
+        if not native_replicas:
+            raise RuntimeError("shared_bundle scenario requires an initialized native replica")
+        claims = await self._snapshot_native_claims(native_replicas[0], "d2-local-donor-task")
+        if not claims:
+            raise RuntimeError("shared_bundle scenario requires at least one native worker")
+        source = copy.deepcopy(claims[0])
+        specs = []
+        for suffix in ("a", "b"):
+            claim = copy.deepcopy(source)
+            claim["claim_id"] = f"d4-shared-bundle-{suffix}-claim"
+            claim["rank"] = 0
+            claim["node_rank"] = 0
+            claim["local_rank"] = 0
+            claim["gpu_fraction"] = 0.25
+            claim["cpu_request"] = 0.5
+            stamp = time.time_ns()
+            specs.append(
+                {
+                    "operation_id": f"d4-shared-bundle-{suffix}-{stamp}",
+                    "lease_id": f"d4-shared-bundle-lease-{suffix}-{stamp}",
+                    "lease_ids": [claim["lease_id"]],
+                    "borrower_task_id": "d4-shared-bundle-borrower-task",
+                    "borrower_replica_id": f"d4-shared-bundle-{suffix}",
+                    "claims": [claim],
+                    "world_size": 1,
+                    "max_colocate_count": 2,
+                    "expires_at": time.time() + 600.0,
+                    "placement_epoch": 1,
+                    "parallelism": {
+                        "tensor_model_parallel_size": 1,
+                        "data_parallel_size": 1,
+                        "pipeline_model_parallel_size": 1,
+                    },
+                    "creation_timeout_s": 600.0,
+                }
+            )
+        return specs
+
+    async def run_d4_shared_bundle_smoke(self) -> dict:
+        """Exercise same-bundle placement without changing production state.
+
+        No CE registration or LB commit is performed because HCCL permits one
+        effective worker per physical bundle.  This test intentionally checks
+        only independent Ray/vLLM runtime creation and cleanup; donor and
+        borrowed CE/LB lifecycle remains a later production transaction.
+        """
+        specs = await self._build_shared_bundle_test_specs()
+        donors = self._local_native_donors(specs[0])
+        slept_donors = []
+        records = []
+        cleanup_results = []
+        cleanup_errors = []
+        primary_error = None
+        try:
+            for donor in donors:
+                await self._test_memory_call(donor, "sleep_for_runtime_test")
+                slept_donors.append(donor)
+            for index, spec in enumerate(specs):
+                receipt = await self.create_borrowed_replica(spec)
+                if receipt.get("state") != "RUNTIME_READY":
+                    raise RuntimeError(f"shared_bundle create {index} failed: {receipt}")
+                record = self.borrowed_operations.get(spec["lease_id"])
+                if record is None or record.get("replica") is None:
+                    raise RuntimeError(f"shared_bundle create {index} has no runtime record")
+                records.append(record)
+                # The second runtime is intentionally serialized after the
+                # first engine has released weights/KV cache.  Ray placement
+                # remains simultaneous (both CE actors are alive), while NPU
+                # memory does not require two active engines.
+                if index == 0:
+                    await self._test_memory_call(record["replica"], "sleep_for_runtime_test")
+                    record["_shared_test_server_sleeping"] = True
+            result = {
+                "scenario": "shared_bundle",
+                "status": "PASS",
+                "state": "PLACEMENT_READY",
+                "shared_slot": {
+                    "pg_id": specs[0]["claims"][0]["pg_id"],
+                    "bundle_index": specs[0]["claims"][0]["bundle_index"],
+                    "node_id": specs[0]["claims"][0]["node_id"],
+                    "gpu_uuid": specs[0]["claims"][0]["gpu_uuid"],
+                },
+                "replica_ranks": [record["replica_rank"] for record in records],
+                "world_sizes": [spec["world_size"] for spec in specs],
+                "gpu_fractions": [spec["claims"][0]["gpu_fraction"] for spec in specs],
+                "serialized_server_start": True,
+                "ce_lb_skipped": True,
+            }
+        except Exception as exc:
+            primary_error = exc
+            result = None
+        finally:
+            for record in reversed(records):
+                replica = record.get("replica")
+                if replica is None:
+                    continue
+                try:
+                    if not record.get("_shared_test_server_sleeping"):
+                        await self._test_memory_call(replica, "sleep_for_runtime_test")
+                    cleanup = await replica._cleanup_runtime()
+                    cleanup_results.append({"replica_rank": record["replica_rank"], "cleanup": cleanup})
+                    self.rollout_replicas = [item for item in self.rollout_replicas if item is not replica]
+                    record["state"] = "DESTROYED"
+                    record["cleanup"] = copy.deepcopy(cleanup)
+                except Exception as exc:
+                    cleanup_errors.append({"replica_rank": record.get("replica_rank"), "error": str(exc)})
+            for donor in reversed(slept_donors):
+                try:
+                    await self._test_memory_call(donor, "wake_for_runtime_test")
+                except Exception as exc:
+                    cleanup_errors.append({"donor_rank": donor.replica_rank, "error": str(exc)})
+        if primary_error is not None:
+            if cleanup_errors:
+                raise RuntimeError(
+                    f"shared_bundle failed: {primary_error}; cleanup errors: {cleanup_errors}"
+                ) from primary_error
+            raise primary_error
+        if cleanup_errors:
+            raise RuntimeError(f"shared_bundle cleanup failed: {cleanup_errors}")
+        result["cleanup"] = cleanup_results
+        result["cleanup_complete"] = True
+        print(f"D4_SHARED_BUNDLE_RESULT {json.dumps(result, sort_keys=True, default=str)}")
+        return result
 
     async def run_d2_runtime_smoke(self, scenario: str, cleanup_after_test: bool = True) -> dict:
         """Run one real-placement D2 create scenario; CE/LB remain untouched."""

@@ -190,17 +190,33 @@ run_d4_scenario() {
         D4_RUNTIME_SCENARIOS="${d4_scenario}" \
         D4_RUNTIME_LOG_DIR="${child_log_dir}" \
         bash "${SCRIPT_DIR}/D4_test.sh"; then
-        if grep -Fq 'D4_RUNTIME_RESULT' "${log_file}" && \
-            grep -Fq '"state": "LB_READY"' "${log_file}" && \
-            grep -Fq 'D4_RUNTIME_CLEANUP' "${log_file}" && \
+        shared_bundle_ok=0
+        if [ "${d4_scenario}" = "shared_bundle" ] && \
+            grep -Fq 'D4_SHARED_BUNDLE_RESULT' "${log_file}" && \
+            grep -Fq '"state": "PLACEMENT_READY"' "${log_file}" && \
+            grep -Fq 'D4_SHARED_BUNDLE_CLEANUP' "${log_file}"; then
+            shared_bundle_ok=1
+        fi
+        runtime_ok=0
+        if { \
+            { grep -Fq 'D4_RUNTIME_RESULT' "${log_file}"; } || \
+            { [ "${d4_scenario}" = "idempotent" ] && grep -Fq 'D4_IDEMPOTENCY_RESULT' "${log_file}"; } || \
+            { [ "${d4_scenario}" = "concurrent_idempotent" ] && grep -Fq 'D4_CONCURRENCY_RESULT' "${log_file}"; }; \
+        } && grep -Fq '"state": "LB_READY"' "${log_file}" && \
+            grep -Fq 'D4_RUNTIME_CLEANUP' "${log_file}"; then
+            runtime_ok=1
+        fi
+        if { [ "${shared_bundle_ok}" -eq 1 ] || [ "${runtime_ok}" -eq 1 ]; } && \
             ! has_error_marker "${log_file}"; then
             if [ "${coverage}" = "complete" ]; then
                 record_result "${scenario}" PASS "${log_file}" "D4 创建、CE bootstrap、LB_READY 和测试清理通过"
+            elif [ "${d4_scenario}" = "shared_bundle" ]; then
+                record_result "${scenario}" INCOMPLETE "${log_file}" "同 bundle fractional CE Worker 的串行 placement 和清理通过；HCCL/LB 同时接流被设计约束，尚缺真实生成与普通同步"
             else
                 record_result "${scenario}" INCOMPLETE "${log_file}" "当前 D4 只验证 endpoint/LB marker，缺少综合设计要求的真实 generate/后续同步或完整拓扑"
             fi
         else
-            record_result "${scenario}" FAIL "${log_file}" "D4 日志缺少 LB_READY、cleanup 或 runtime receipt"
+            record_result "${scenario}" FAIL "${log_file}" "D4 日志缺少所需 runtime/shared-bundle receipt、cleanup 或包含异常"
         fi
     else
         record_result "${scenario}" FAIL "${log_file}" "D4 main_ppo 进程失败"
@@ -272,7 +288,10 @@ case "${scenario}" in
     S2) run_d4_scenario S2 split partial ;;
     S3) run_d4_scenario S3 cross_pg partial ;;
     S4) run_d4_scenario S4 fragmented partial ;;
-    S8|S9) run_unit_only "${scenario}" ;;
+    S5) run_d4_scenario S5 shared_bundle partial ;;
+    S7) run_d4_scenario S7 merge_world_size partial ;;
+    S8) run_d4_scenario S8 idempotent partial ;;
+    S9) run_d4_scenario S9 concurrent_idempotent partial ;;
     S10) run_d2_negative S10 expired ;;
     S11) run_d2_negative S11 missing_pg,duplicate_device ;;
     S12|S13|S14|S16) mark_blocked "${scenario}" ;;

@@ -60,15 +60,15 @@ esac
 for scenario in $(printf '%s' "${D4_RUNTIME_SCENARIOS}" | tr ',' ' '); do
     [ -n "${scenario}" ] || continue
     case "${scenario}" in
-        basic|split|fragmented|cross_pg)
+        basic|split|fragmented|cross_pg|shared_bundle|merge_world_size|idempotent|concurrent_idempotent)
             ;;
         *)
-            echo "D4 不支持场景：${scenario}；可选 basic、split、fragmented、cross_pg。" >&2
+            echo "D4 不支持场景：${scenario}；可选 basic、split、fragmented、cross_pg、shared_bundle、merge_world_size、idempotent、concurrent_idempotent。" >&2
             exit 1
             ;;
     esac
 
-    if [ "${scenario}" = "cross_pg" ]; then
+    if [ "${scenario}" = "cross_pg" ] || [ "${scenario}" = "merge_world_size" ]; then
         export ROLLOUT_TP="${D4_CROSS_PG_ROLLOUT_TP:-2}"
     else
         export ROLLOUT_TP="${D4_ROLLOUT_TP:-4}"
@@ -106,14 +106,38 @@ for scenario in $(printf '%s' "${D4_RUNTIME_SCENARIOS}" | tr ',' ' '); do
         echo "场景 ${scenario} 的日志写入失败，tee exit=${command_statuses[1]}；日志：${log_file}" >&2
         exit "${command_statuses[1]}"
     fi
-    if ! grep -Fq "D4_RUNTIME_RESULT" "${log_file}" || \
-        ! grep -Fq '"state": "LB_READY"' "${log_file}"; then
-        echo "场景 ${scenario} 没有达到 LB_READY；日志：${log_file}" >&2
-        exit 1
-    fi
-    if ! grep -Fq "D4_RUNTIME_CLEANUP" "${log_file}"; then
-        echo "场景 ${scenario} 没有完成 D4 测试清理；日志：${log_file}" >&2
-        exit 1
+    if [ "${scenario}" = "shared_bundle" ]; then
+        # S5 只验证同一 bundle 上多个 fractional CE Worker 的串行创建和
+        # 回收。它不会把两个 active Worker 同时加入 HCCL effective set，
+        # 因而不应伪造 LB_READY 证据。
+        if ! grep -Fq "D4_SHARED_BUNDLE_RESULT" "${log_file}" || \
+            ! grep -Fq '"state": "PLACEMENT_READY"' "${log_file}" || \
+            ! grep -Fq "D4_SHARED_BUNDLE_CLEANUP" "${log_file}"; then
+            echo "场景 ${scenario} 缺少 shared-bundle placement 或 cleanup 证据；日志：${log_file}" >&2
+            exit 1
+        fi
+    else
+        if [ "${scenario}" = "idempotent" ]; then
+            if ! grep -Fq "D4_IDEMPOTENCY_RESULT" "${log_file}" || \
+                ! grep -Fq '"state": "LB_READY"' "${log_file}"; then
+                echo "场景 ${scenario} 缺少 LB_READY 或重复 create 的幂等性证据；日志：${log_file}" >&2
+                exit 1
+            fi
+        elif [ "${scenario}" = "concurrent_idempotent" ]; then
+            if ! grep -Fq "D4_CONCURRENCY_RESULT" "${log_file}" || \
+                ! grep -Fq '"state": "LB_READY"' "${log_file}"; then
+                echo "场景 ${scenario} 缺少 LB_READY 或并发 create 的幂等性证据；日志：${log_file}" >&2
+                exit 1
+            fi
+        elif ! grep -Fq "D4_RUNTIME_RESULT" "${log_file}" || \
+            ! grep -Fq '"state": "LB_READY"' "${log_file}"; then
+            echo "场景 ${scenario} 没有达到 LB_READY；日志：${log_file}" >&2
+            exit 1
+        fi
+        if ! grep -Fq "D4_RUNTIME_CLEANUP" "${log_file}"; then
+            echo "场景 ${scenario} 没有完成 D4 测试清理；日志：${log_file}" >&2
+            exit 1
+        fi
     fi
     if grep -Eq "Traceback|AssertionError|LIFECYCLE_NOT_IMPLEMENTED" "${log_file}"; then
         echo "场景 ${scenario} 日志包含未处理异常或错误生命周期回执；日志：${log_file}" >&2

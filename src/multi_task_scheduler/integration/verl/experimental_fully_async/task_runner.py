@@ -14,9 +14,11 @@
 
 """Replace creation targets while inheriting the native initialization and fit loop."""
 
-import logging
+import copy
 import json
+import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import ray
 
@@ -125,6 +127,17 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
         scenario = str(test_config.get("scenario", "split"))
         rollouter = self.components["rollouter"]
         trainer = self.components["trainer"]
+
+        # S5 is intentionally a placement-only fixture.  It creates two
+        # independent borrowed workers on one donor bundle, serializing the
+        # vLLM engine memory footprint and skipping CE/LB membership because
+        # HCCL allows only one effective worker per physical bundle.
+        if scenario == "shared_bundle":
+            result = ray.get(rollouter.run_d4_shared_bundle_smoke.remote())
+            print(f"D4_SHARED_BUNDLE_RESULT {json.dumps(result, sort_keys=True, default=str)}")
+            print(f"D4_SHARED_BUNDLE_CLEANUP {json.dumps(result.get('cleanup', []), sort_keys=True, default=str)}")
+            return
+
         prepared = ray.get(rollouter.prepare_d4_runtime_smoke.remote(scenario))
         if prepared.get("expected_failure"):
             raise RuntimeError(f"D4 smoke requires a success scenario: {scenario}")
@@ -132,24 +145,115 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
         suspended = False
         replica_rank = None
         cleanup_done = False
+        registered_for_ce = False
         try:
             if donor_ranks:
                 ray.get(trainer.suspend_donors_for_borrow.remote(donor_ranks))
                 suspended = True
-            result = self.execute_replica_operation("create", prepared["spec"])
-            replica_rank = result.get("replica_rank")
+
+            if scenario == "idempotent":
+                # The same lease/spec is submitted twice.  The manager's
+                # idempotency table must return the same rank and endpoint
+                # without creating another CE worker or HTTP server.
+                result = self.execute_replica_operation("create", prepared["spec"])
+                repeat = self.execute_replica_operation("create", copy.deepcopy(prepared["spec"]))
+                replica_rank = result.get("replica_rank")
+                if replica_rank is None or repeat.get("replica_rank") != replica_rank:
+                    raise RuntimeError(f"D4 idempotency allocated different replica ranks: {result} / {repeat}")
+                first_server = (result.get("ready") or {}).get("server_id")
+                repeat_server = repeat.get("server_id") or (repeat.get("ready") or {}).get("server_id")
+                snapshot = ray.get(rollouter.test_operation_snapshot.remote(prepared["spec"]["lease_id"]))
+                same_server = bool(first_server) and first_server == repeat_server == snapshot.get("server_id")
+                one_runtime = snapshot.get("worker_count") == snapshot.get("server_count") == 1
+                if not same_server or not one_runtime:
+                    raise RuntimeError(
+                        "D4 idempotency did not preserve one runtime: "
+                        f"same_server={same_server}, one_runtime={one_runtime}, snapshot={snapshot}"
+                    )
+                print(
+                    "D4_IDEMPOTENCY_RESULT "
+                    + json.dumps(
+                        {
+                            "scenario": scenario,
+                            "state": repeat.get("state"),
+                            "same_rank": True,
+                            "same_server": same_server,
+                            "worker_count": snapshot.get("worker_count"),
+                            "server_count": snapshot.get("server_count"),
+                        },
+                        sort_keys=True,
+                    )
+                )
+            elif scenario == "concurrent_idempotent":
+                # Two GS-like calls arrive concurrently.  The task-local
+                # operation lock must serialize creation and make the second
+                # request an idempotent receipt for the first runtime.
+                with ThreadPoolExecutor(max_workers=2, thread_name_prefix="d4-create") as pool:
+                    futures = [
+                        pool.submit(self.execute_replica_operation, "create", copy.deepcopy(prepared["spec"]))
+                        for _ in range(2)
+                    ]
+                    results = [future.result() for future in futures]
+                ranks = [item.get("replica_rank") for item in results]
+                if not ranks or len(set(ranks)) != 1:
+                    raise RuntimeError(f"D4 concurrent idempotency allocated different ranks: {results}")
+                replica_rank = int(ranks[0])
+                snapshot = ray.get(rollouter.test_operation_snapshot.remote(prepared["spec"]["lease_id"]))
+                servers = {
+                    (item.get("ready") or {}).get("server_id") or item.get("server_id")
+                    for item in results
+                }
+                servers.discard(None)
+                if (
+                    len(servers) != 1
+                    or snapshot.get("worker_count") != 1
+                    or snapshot.get("server_count") != 1
+                ):
+                    raise RuntimeError(
+                        f"D4 concurrent idempotency created duplicate runtime: results={results}, snapshot={snapshot}"
+                    )
+                print(
+                    "D4_CONCURRENCY_RESULT "
+                    + json.dumps(
+                        {
+                            "scenario": scenario,
+                            "state": results[0].get("state"),
+                            "same_rank": True,
+                            "same_server": True,
+                            "worker_count": snapshot.get("worker_count"),
+                            "server_count": snapshot.get("server_count"),
+                        },
+                        sort_keys=True,
+                    )
+                )
+                result = results[0]
+            else:
+                result = self.execute_replica_operation("create", prepared["spec"])
+                replica_rank = result.get("replica_rank")
+
             if replica_rank is not None:
                 replica_rank = int(replica_rank)
             if result.get("state") != "LB_READY":
                 raise RuntimeError(f"D4 create chain did not reach LB_READY: {result}")
+            registered_for_ce = True
             probe = ray.get(rollouter.probe_replica_ready.remote(replica_rank))
             print(f"D4_RUNTIME_RESULT {json.dumps(result | {'probe': probe}, sort_keys=True, default=str)}")
+            if scenario in {"idempotent", "concurrent_idempotent"} and registered_for_ce:
+                # Keep the operation fixture isolated: CE membership is
+                # removed before the borrowed actors are torn down.
+                ray.get(trainer.unregister_replica.remote(replica_rank))
+                registered_for_ce = False
             cleanup = ray.get(rollouter.cleanup_d4_runtime.remote(replica_rank))
             cleanup_done = True
             print(f"D4_RUNTIME_CLEANUP {json.dumps(cleanup, sort_keys=True, default=str)}")
         finally:
             if replica_rank is not None and not cleanup_done:
                 try:
+                    # New idempotency fixtures explicitly remove CE
+                    # membership before actor cleanup.  Existing scenarios
+                    # preserve their historical teardown path.
+                    if registered_for_ce and scenario in {"idempotent", "concurrent_idempotent"}:
+                        ray.get(trainer.unregister_replica.remote(replica_rank))
                     cleanup = ray.get(rollouter.cleanup_d4_runtime.remote(replica_rank))
                     print(f"D4_RUNTIME_CLEANUP {json.dumps(cleanup, sort_keys=True, default=str)}")
                 except Exception:
