@@ -34,6 +34,7 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
         super().__init__(*args, **kwargs)
         self.parameter_snapshot_gate = asyncio.Lock()
         self.parameter_validation_enabled = self._read_parameter_validation_enabled(self.config)
+        self.source_validation_enabled = self._read_source_validation_enabled(self.config)
         self._training_completion = None
         self._d3_bootstrap_rank = None
         self._d3_cleanup_after_test = True
@@ -46,6 +47,15 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
         config_get = getattr(config, "get", None)
         multitask = config_get("multitask", {}) if callable(config_get) else getattr(config, "multitask", {})
         validation = multitask.get("parameter_validation", {}) if multitask is not None else {}
+        enabled = validation.get("enabled", False) if hasattr(validation, "get") else False
+        return bool(enabled)
+
+    @staticmethod
+    def _read_source_validation_enabled(config) -> bool:
+        """Read the stricter actor-source to CE-receiver verification switch."""
+        config_get = getattr(config, "get", None)
+        multitask = config_get("multitask", {}) if callable(config_get) else getattr(config, "multitask", {})
+        validation = multitask.get("source_validation", {}) if multitask is not None else {}
         enabled = validation.get("enabled", False) if hasattr(validation, "get") else False
         return bool(enabled)
 
@@ -98,6 +108,7 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
             config=checkpoint_engine_config, actor_wg=self.actor_wg, replicas=replicas
         )
         self.checkpoint_manager.parameter_validation_enabled = self.parameter_validation_enabled
+        self.checkpoint_manager.source_validation_enabled = self.source_validation_enabled
         print(f"[FullyAsyncTrainer] Checkpoint manager initialized (backend={checkpoint_engine_config.backend})")
 
     async def register_replica(self, replica_rank: int) -> dict:

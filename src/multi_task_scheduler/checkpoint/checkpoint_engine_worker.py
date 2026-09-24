@@ -15,7 +15,10 @@ class MultiTaskCheckpointEngineWorker(CheckpointEngineWorker):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.parameter_validation_enabled = os.environ.get("MULTITASK_PARAMETER_VALIDATION", "0") == "1"
+        self.parameter_validation_enabled = (
+            os.environ.get("MULTITASK_PARAMETER_VALIDATION", "0") == "1"
+            or os.environ.get("MULTITASK_SOURCE_VALIDATION", "0") == "1"
+        )
         self._last_parameter_manifest = {
             "complete": False,
             "global_steps": None,

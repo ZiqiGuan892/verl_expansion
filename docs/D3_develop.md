@@ -137,14 +137,14 @@ python -m pytest -q -p no:cacheprovider \
 新增 `D3_test.sh`。服务器从原生 `verl` 目录执行：
 
 ```bash
-bash ../D3_test.sh
+MULTITASK_PARAMETER_VALIDATION=1 MULTITASK_SOURCE_VALIDATION=1 bash ../D3_test.sh
 ```
 
 脚本复用 `multi_task_run.sh` 的模型、数据、Ascend、Python 路径和训练配置。由于当前
 Ascend 运行时的 `PyHcclCommunicator` 没有原生 HCCL 后端调用的 `destroyComm` 方法，
-D3 脚本选择插件内的 `multitask_hccl` 后端：它继承原生 HCCL 的传输逻辑，只替换
-通信域销毁适配，并通过 `custom_backend_module` 在训练 Worker、CE Worker 和 Trainer
-侧注册同一个后端。
+D3 脚本选择插件内的 `multitask_hccl` 后端：它继承原生 HCCL 的传输逻辑，适配
+通信域销毁，并在 source validation 开启时审计 Actor rank 0 的发送参数流；通过
+`custom_backend_module` 在训练 Worker、CE Worker 和 Trainer 侧注册同一个后端。
 
 脚本只追加：
 
@@ -152,6 +152,8 @@ D3 脚本选择插件内的 `multitask_hccl` 后端：它继承原生 HCCL 的�
 actor_rollout_ref.rollout.checkpoint_engine.backend=multitask_hccl
 actor_rollout_ref.rollout.checkpoint_engine.custom_backend_module=multi_task_scheduler.checkpoint.hccl_checkpoint_engine
 +actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.multitask_hccl.rebuild_group=true
++multitask.parameter_validation.enabled=true
++multitask.source_validation.enabled=true
 +multitask.d3_bootstrap_test.enabled=true
 +multitask.d3_bootstrap_test.scenario=split
 +multitask.d3_bootstrap_test.cleanup_after_test=true
@@ -326,7 +328,14 @@ bootstrap 或普通同步收尾时比较所有 CE Worker 的完整 manifest，�
 会增加同步开销；D0/D3/D4 验收脚本显式打开。`delta_flush` 暂不支持完整 manifest 校验，
 开启严格校验时会明确失败，不能伪报成功。
 
-这项 MVP 校验的是 CE 接收流的逐参数完整性、各接收 Worker 之间的一致性以及版本号；
-它不会把完整模型副本回传 driver 再与 actor 逐参数重算。若后续需要证明 actor 源模型与
-接收值的绝对相等，应在发送端增加同格式的 source manifest，再由 Manager 做 source-to-receiver
-比对。
+在 D3/D4 使用 `multitask_hccl` 时，`MULTITASK_SOURCE_VALIDATION=1` 配合
+`+multitask.source_validation.enabled=true` 还会让
+Actor rank 0 在发送参数流时生成 source manifest。Manager 读取该 manifest，并把每个 CE
+Worker 的 name、shape、dtype、numel 和 SHA-256 逐项比较；通过后同一条回执会包含：
+
+```text
+"source_state": "SOURCE_TO_RECEIVER_VALIDATED"
+```
+
+普通 `nccl` 或 `delta_flush` 路径没有 source manifest 接口时不会伪造该回执，严格场景会
+明确失败。source validation 只传递摘要元数据，不会把完整模型副本回传 driver。

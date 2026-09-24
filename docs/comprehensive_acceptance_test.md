@@ -296,9 +296,14 @@ MULTITASK_TRAINING_COMPLETE {"state": "COMPLETED", "completed": true,
 每个 named tensor 时记录 name、shape、dtype、numel 和 SHA-256，Manager 比较所有接收
 Worker 的完整 manifest，并核对本次冻结的参数版本。只看到 `WEIGHTS_READY` 或
 `FULL_SYNC_READY` 而没有逐参数 manifest，不能证明参数内容一致。该校验默认关闭，D0、D3、
-D4 验收脚本显式打开，因为逐参数 hash 会增加同步开销。当前 MVP 比对的是 CE 接收流和
-各 CE Worker 之间的一致性；若要证明 actor 源模型的绝对等价，还需要增加发送端 source
-manifest，这不属于本次批量验收改动。
+D4 验收脚本显式打开，因为逐参数 hash 会增加同步开销。
+
+D3/D4 还显式打开 `MULTITASK_SOURCE_VALIDATION=1` 和
+`multitask.source_validation.enabled`。在 `multitask_hccl` 后端中，
+Actor rank 0 同时生成 source manifest，Manager 对 source 与每个 CE Worker 的 manifest
+逐参数比较。回执必须包含 `"source_state": "SOURCE_TO_RECEIVER_VALIDATED"`；只有
+`WEIGHTS_READY`、`FULL_SYNC_READY` 或接收侧 digest 一致而缺少该字段，不能证明参数
+确实等于 Actor 源模型。
 
 ## 8. 一键综合脚本实现
 
@@ -308,7 +313,7 @@ manifest，这不属于本次批量验收改动。
 
 | 场景 | 执行入口 | 当前判定 |
 | --- | --- | --- |
-| S0 | `multi_task_run.sh`，只启用 CE 逐参数校验，不启用 borrowed smoke hook | 必须有全 step 完成回执和 CE manifest 校验才为 `PASS` |
+| S0 | `multi_task_run.sh`，只启用 CE 接收侧逐参数校验，不启用 borrowed smoke hook | 必须有全 step 完成回执和 CE manifest 校验才为 `PASS`；默认 `nccl` 不做 source manifest 比对 |
 | S1 | `D4_test.sh basic` | 当前 D4 只验证到 LB/endpoint，因此为 `INCOMPLETE` |
 | S2 | `D4_test.sh split` | 只创建一个拆分后的 borrower，尚未验证两个 borrower 同时存在，为 `INCOMPLETE` |
 | S3 | `D4_test.sh cross_pg` | 当前只验证跨 PG claim，尚未验证 2+2 合成 world_size=4，为 `INCOMPLETE` |

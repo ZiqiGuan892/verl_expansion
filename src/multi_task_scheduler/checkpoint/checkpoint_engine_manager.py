@@ -34,6 +34,9 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         # hashing every model tensor adds measurable transfer-time overhead.
         # D3/D4 acceptance scripts enable it when they need strict evidence.
         self.parameter_validation_enabled = False
+        # Stricter actor-source to CE-receiver comparison.  The configured
+        # checkpoint backend must expose get_source_manifest() on actor rank 0.
+        self.source_validation_enabled = False
         # Replica ranks temporarily excluded from the effective CE set while
         # their physical slots are leased to a borrowed replica.  The donor
         # server is slept by the rollout manager; this set prevents its CE
@@ -177,10 +180,12 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             try:
                 result = await super().update_weights(global_steps=global_steps)
                 version = int(global_steps) if global_steps is not None else None
-                if self.parameter_validation_enabled:
+                if self.parameter_validation_enabled or self.source_validation_enabled:
+                    source_manifest = await self._get_source_manifest() if self.source_validation_enabled else None
                     validation = await self.validate_parameter_sync(
                         replicas=self.inflight_replicas,
                         expected_version=version,
+                        source_manifest=source_manifest,
                     )
                     if isinstance(result, dict):
                         result["parameter_validation"] = validation
@@ -256,10 +261,12 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
                 kv_resumed = True
                 await registered.resume_generation()
                 generation_resumed = True
-                if self.parameter_validation_enabled:
+                if self.parameter_validation_enabled or self.source_validation_enabled:
+                    source_manifest = await self._get_source_manifest() if self.source_validation_enabled else None
                     validation = await self.validate_parameter_sync(
                         replicas=[registered],
                         expected_version=snapshot_version,
+                        source_manifest=source_manifest,
                     )
                     print(f"CE_PARAMETER_VALIDATION {json.dumps(validation, sort_keys=True, default=str)}")
                 self.last_synced_versions[rank] = snapshot_version
@@ -273,7 +280,7 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
                     "communication": "target_only",
                     "finalized": True,
                 }
-                if self.parameter_validation_enabled:
+                if self.parameter_validation_enabled or self.source_validation_enabled:
                     result["parameter_validation"] = validation
                 return result
             except Exception:
@@ -323,14 +330,49 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
-    async def validate_parameter_sync(self, replicas, expected_version: int | None = None) -> dict:
+    async def _get_source_manifest(self) -> dict:
+        """Read the canonical source manifest from actor checkpoint rank 0."""
+        refs = self.actor_wg.execute_checkpoint_engine(["get_source_manifest"] * self.actor_wg.world_size)
+        manifests = ray.get(refs)
+        for manifest in manifests:
+            if isinstance(manifest, dict) and manifest.get("complete", False):
+                return manifest
+        raise RuntimeError(f"actor source manifest is unavailable or incomplete: {manifests}")
+
+    @staticmethod
+    def _manifest_mismatches(expected: dict, actual: dict, limit: int = 8) -> list[dict]:
+        expected_entries = {item.get("name"): item for item in expected.get("parameters", [])}
+        actual_entries = {item.get("name"): item for item in actual.get("parameters", [])}
+        mismatches = []
+        for name in sorted(set(expected_entries) | set(actual_entries)):
+            source = expected_entries.get(name)
+            received = actual_entries.get(name)
+            if source is None or received is None:
+                mismatches.append({"name": name, "source": source, "received": received})
+                continue
+            fields = ("shape", "dtype", "numel", "sha256")
+            differences = {
+                field: {"source": source.get(field), "received": received.get(field)}
+                for field in fields
+                if source.get(field) != received.get(field)
+            }
+            if differences:
+                mismatches.append({"name": name, "differences": differences})
+            if len(mismatches) >= limit:
+                break
+        return mismatches
+
+    async def validate_parameter_sync(
+        self, replicas, expected_version: int | None = None, source_manifest: dict | None = None
+    ) -> dict:
         """Verify every received parameter on every CE Worker.
 
         The receiver worker records a SHA-256 fingerprint while streaming each
         named tensor into ``ServerAdapter``.  This method compares the complete
         name/shape/dtype/value manifest across all workers and checks the
-        frozen sync version.  It returns metadata only; tensor payloads never
-        leave the CE Worker process.
+        frozen sync version.  When ``source_manifest`` is provided, every
+        receiver is also compared against the actor source field by field.
+        It returns metadata only; tensor payloads never leave worker processes.
         """
         workers = [worker for replica in replicas for worker in getattr(replica, "workers", [])]
         if not workers:
@@ -346,11 +388,25 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
                 raise RuntimeError(
                     f"CE parameter version mismatch: expected={expected_version}, received={mismatched_versions}"
                 )
+        if source_manifest is not None:
+            if not source_manifest.get("complete", False):
+                raise RuntimeError(f"actor source manifest is incomplete: {source_manifest}")
+            if expected_version is not None and source_manifest.get("global_steps") != expected_version:
+                raise RuntimeError(
+                    f"actor source parameter version mismatch: expected={expected_version}, "
+                    f"received={source_manifest.get('global_steps')}"
+                )
+            for worker_index, manifest in enumerate(manifests):
+                mismatches = self._manifest_mismatches(source_manifest, manifest)
+                if mismatches:
+                    raise RuntimeError(
+                        f"CE worker {worker_index} differs from actor source manifest: {mismatches}"
+                    )
         digests = [self._manifest_digest(manifest) for manifest in manifests]
         if len(set(digests)) != 1:
             raise RuntimeError(f"CE workers received different parameter manifests: {digests}")
         first = manifests[0]
-        return {
+        result = {
             "state": "PARAMETERS_VALIDATED",
             "version": first.get("global_steps"),
             "worker_count": len(manifests),
@@ -358,3 +414,11 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             "total_numel": first.get("total_numel", 0),
             "manifest_digest": digests[0],
         }
+        if source_manifest is not None:
+            result.update(
+                {
+                    "source_state": "SOURCE_TO_RECEIVER_VALIDATED",
+                    "source_manifest_digest": self._manifest_digest(source_manifest),
+                }
+            )
+        return result

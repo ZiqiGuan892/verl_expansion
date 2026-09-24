@@ -84,7 +84,7 @@ for scenario in $(printf '%s' "${D3_RUNTIME_SCENARIOS}" | tr ',' ' '); do
     echo "日志：${log_file}"
 
     set +e
-    env MULTITASK_PARAMETER_VALIDATION=1 bash "${SCRIPT_DIR}/multi_task_run.sh" \
+    env MULTITASK_PARAMETER_VALIDATION=1 MULTITASK_SOURCE_VALIDATION=1 bash "${SCRIPT_DIR}/multi_task_run.sh" \
         "actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}" \
         "actor_rollout_ref.rollout.n=${RESPONSES_PER_PROMPT}" \
         "async_training.require_batches=${ASYNC_REQUIRE_BATCHES}" \
@@ -98,6 +98,7 @@ for scenario in $(printf '%s' "${D3_RUNTIME_SCENARIOS}" | tr ',' ' '); do
         "actor_rollout_ref.rollout.checkpoint_engine.custom_backend_module=multi_task_scheduler.checkpoint.hccl_checkpoint_engine" \
         "+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.multitask_hccl.rebuild_group=true" \
         "+multitask.parameter_validation.enabled=true" \
+        "+multitask.source_validation.enabled=true" \
         "+multitask.d3_bootstrap_test.enabled=true" \
         "+multitask.d3_bootstrap_test.scenario=${scenario}" \
         "+multitask.d3_bootstrap_test.cleanup_after_test=true" \
@@ -122,6 +123,10 @@ for scenario in $(printf '%s' "${D3_RUNTIME_SCENARIOS}" | tr ',' ' '); do
     if ! grep -Fq "CE_PARAMETER_VALIDATION" "${log_file}" || \
         ! grep -Fq '"state": "PARAMETERS_VALIDATED"' "${log_file}"; then
         echo "场景 ${scenario} 缺少 CE Worker 逐参数校验证据；日志：${log_file}" >&2
+        exit 1
+    fi
+    if ! grep -Fq '"source_state": "SOURCE_TO_RECEIVER_VALIDATED"' "${log_file}"; then
+        echo "场景 ${scenario} 缺少 actor source manifest 与 CE Worker 的逐参数比对证据；日志：${log_file}" >&2
         exit 1
     fi
     if ! grep -Fq "D3_BOOTSTRAP_RESULT" "${log_file}" || \

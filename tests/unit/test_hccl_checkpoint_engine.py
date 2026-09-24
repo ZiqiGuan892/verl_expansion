@@ -34,7 +34,7 @@ def backend(monkeypatch):
         def init_process_group(self):
             pass
 
-        def send_weights(self):
+        async def send_weights(self, *args, **kwargs):
             pass
 
         def receive_weights(self):
@@ -46,12 +46,26 @@ def backend(monkeypatch):
         empty_cache=Mock(),
     )
     module_attributes = {
-        "torch": {"npu": npu},
+        "torch": {"npu": npu, "Tensor": object, "uint8": object},
         "verl": {"__path__": []},
         "verl.checkpoint_engine": {"__path__": []},
         "verl.checkpoint_engine.base": {"CheckpointEngineRegistry": SimpleNamespace(register=register)},
         "verl.checkpoint_engine.hccl_checkpoint_engine": {"HCCLCheckpointEngine": NativeHCCL},
+        "verl.workers": {"__path__": []},
+        "verl.workers.rollout": {"__path__": []},
+        "verl.workers.rollout.utils": {
+            "ensure_async_iterator": None,
+        },
     }
+    async def ensure_async_iterator(iterable):
+        if hasattr(iterable, "__aiter__"):
+            async for item in iterable:
+                yield item
+        else:
+            for item in iterable:
+                yield item
+
+    module_attributes["verl.workers.rollout.utils"]["ensure_async_iterator"] = ensure_async_iterator
     for name, attrs in module_attributes.items():
         module = ModuleType(name)
         module.__dict__.update(attrs)
@@ -134,5 +148,6 @@ def test_plugin_registers_separate_backend_and_inherits_transfer(backend):
     engine, _, _, registry, native = backend
     assert registry["multitask_hccl"] is type(engine)
     assert registry["nccl"] is not type(engine)
-    for method in ("prepare", "init_process_group", "send_weights", "receive_weights"):
+    for method in ("prepare", "init_process_group", "receive_weights"):
         assert getattr(type(engine), method) is getattr(native, method)
+    assert getattr(type(engine), "send_weights") is not getattr(native, "send_weights")

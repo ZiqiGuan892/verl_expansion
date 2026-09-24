@@ -95,7 +95,7 @@ D4 smoke 在 native training 返回后执行，这是为了让 Trainer 已经完
   和不支持的生命周期回执；不启动 Ray/GPU；
 - `D4_test.sh`：沿用 `multi_task_run.sh` 的真实环境、模型和数据配置，通过 main_ppo 执行
   `basic/split/fragmented/cross_pg` 任一或多个场景；检查 `LB_READY`、endpoint probe、
-  cleanup、进程退出码和异常关键字。
+  cleanup、严格训练完成回执以及 CE source-to-receiver 参数校验。
 
 ## 3. 一键真实测试
 
@@ -115,7 +115,12 @@ D4_RUNTIME_SCENARIOS=basic,split,fragmented,cross_pg bash ../D4_test.sh
 2. 出现 `D4_RUNTIME_RESULT` 且 JSON 状态为 `LB_READY`；
 3. `probe` 报告 endpoint 可查询且 server 已在 LB；
 4. 出现 `D4_RUNTIME_CLEANUP`；
-5. 日志不包含 `Traceback`、`AssertionError` 或 `LIFECYCLE_NOT_IMPLEMENTED`。
+5. 非 `shared_bundle` 场景出现 `CE_PARAMETER_VALIDATION` 且包含
+   `source_state=SOURCE_TO_RECEIVER_VALIDATED`；
+6. 出现 `MULTITASK_TRAINING_COMPLETE` 且 `completed_steps == target_steps`。
+
+`Traceback`、`AssertionError` 等文本只保留给故障定位；`LIFECYCLE_NOT_IMPLEMENTED` 仍表示
+当前场景要求的生命周期回执没有实现，属于操作级失败。
 
 脚本中的 `sleep_for_runtime_test()` 仅用于释放同卡 donor 的测试显存，`cleanup_d4_runtime()`
 使用测试 teardown 删除路由并杀死本次创建 Actor；它们不能证明生产 sleep/wake、drain 或

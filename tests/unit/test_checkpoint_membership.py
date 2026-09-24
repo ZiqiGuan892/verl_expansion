@@ -3,6 +3,8 @@
 import ast
 import asyncio
 import copy
+import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -66,6 +68,8 @@ def _manager_class():
         "TestParent": _Parent,
         "asyncio": asyncio,
         "copy": copy,
+        "hashlib": hashlib,
+        "json": json,
         "ray": SimpleNamespace(get=lambda refs: refs),
         "RayClassWithInitArgs": _Factory,
         "RayWorkerGroup": _RayWorkerGroup,
@@ -208,3 +212,54 @@ def test_finalize_failure_does_not_confirm_bootstrap_or_allow_full_sync():
     assert borrowed.serving_version is None
     with pytest.raises(RuntimeError, match="BLOCKED"):
         asyncio.run(manager.update_weights(global_steps=8))
+
+
+class _RemoteManifest:
+    def __init__(self, manifest):
+        self.manifest = manifest
+
+    def remote(self):
+        return self.manifest
+
+
+class _ManifestWorker:
+    def __init__(self, manifest):
+        self.get_parameter_manifest = _RemoteManifest(manifest)
+
+
+def _manifest(version=3, value="abc"):
+    return {
+        "complete": True,
+        "global_steps": version,
+        "wire_format": "named_tensors",
+        "parameters": [
+            {"name": "weight", "shape": [2], "dtype": "torch.float32", "numel": 2, "sha256": value}
+        ],
+        "parameter_count": 1,
+        "total_numel": 2,
+    }
+
+
+def test_source_manifest_is_compared_parameter_by_parameter():
+    manager, _, _ = _manager()
+    source = _manifest()
+    manager.actor_wg.execute_checkpoint_engine = Mock(return_value=[source])
+    worker = _ManifestWorker(source)
+    replica = _replica(4, worker)
+
+    result = asyncio.run(manager.validate_parameter_sync([replica], expected_version=3, source_manifest=source))
+
+    assert result["state"] == "PARAMETERS_VALIDATED"
+    assert result["source_state"] == "SOURCE_TO_RECEIVER_VALIDATED"
+    assert result["source_manifest_digest"] == result["manifest_digest"]
+
+
+def test_source_manifest_mismatch_is_rejected():
+    manager, _, _ = _manager()
+    source = _manifest()
+    received = _manifest(value="different")
+    manager.actor_wg.execute_checkpoint_engine = Mock(return_value=[source])
+    replica = _replica(4, _ManifestWorker(received))
+
+    with pytest.raises(RuntimeError, match="differs from actor source manifest"):
+        asyncio.run(manager.validate_parameter_sync([replica], expected_version=3, source_manifest=source))
