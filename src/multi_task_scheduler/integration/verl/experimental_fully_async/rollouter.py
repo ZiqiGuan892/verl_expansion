@@ -90,9 +90,9 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
         """Return one manager-owned borrowed replica to the Trainer actor."""
         return await self.llm_server_manager.get_replica_for_ce(replica_rank)
 
-    async def cleanup_d3_runtime(self, replica_rank: int) -> dict:
+    async def cleanup_d3_runtime(self, replica_rank: int, global_steps: int | None = None) -> dict:
         """Release only the actors created by the D3 smoke scenario."""
-        return await self.llm_server_manager.cleanup_d3_runtime(replica_rank)
+        return await self.llm_server_manager.cleanup_d3_runtime(replica_rank, global_steps=global_steps)
 
     async def mark_replica_serving_version(self, replica_rank: int, version: int) -> dict:
         """Project the CE-confirmed version onto the manager-owned replica."""

@@ -266,3 +266,8 @@ D3_RUNTIME_SCENARIOS=basic bash ../D3_test.sh
 `DONORS_SLEEPING_BORROWER_ONLY_EFFECTIVE` 和 `D3_NORMAL_SYNC_RESULT`。如果再次出现
 `Free memory on device ... less than desired GPU memory utilization`，需保存完整 Worker
 日志，确认目标 vllm-ascend 版本确实实现了 level-1 sleep 的显存释放。
+
+普通同步结束后，donor 不在本轮 CE 拓扑中，因此其 server 不会通过参数同步自动更新
+`global_steps`。D3 清理阶段在唤醒 donor 后显式调用 `set_global_steps(current_param_version)`；
+否则下一次生成返回的版本字段为 `None`，会在 `detach_utils.py` 的 batch 组装阶段触发
+`None - None`。

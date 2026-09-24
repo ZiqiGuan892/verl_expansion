@@ -400,3 +400,29 @@ D3_RUNTIME_SCENARIOS=basic bash ../D3_test.sh
 
 若日志仍显示 native 与 borrowed workers 同时进入 `build_process_group`，说明服务器没有
 加载最新插件代码或脚本仍使用旧版本。
+
+## 9. donor 唤醒后 rollout 参数版本为空
+
+### 现象
+
+HCCL 拓扑修复后，D3 可以完成 bootstrap 和普通同步，但第一次采样组 batch 时失败：
+
+```text
+TypeError: unsupported operand type(s) for -: 'NoneType' and 'NoneType'
+
+verl/experimental/fully_async_policy/detach_utils.py:153
+param_version_diff = [abs(a - b) for a, b in zip(param_version_end, param_version_start, strict=False)]
+```
+
+### 根因
+
+为避免 donor 与 borrowed CE Worker 在相同 NPU 上重复进入 HCCL，D3 普通同步只更新
+borrowed。donor 随后被唤醒继续生成，但它被排除在本轮 CE 同步之外，vLLM HTTP server
+的 `global_steps` 仍然是初始化值 `None`。生成结果携带空参数版本，batch 组装时执行
+`None - None` 失败。
+
+### 修复
+
+`cleanup_d3_runtime()` 增加可选的 `global_steps` 参数。Trainer 清理 borrowed、唤醒 donor
+后，显式调用继承自原生 server 的 `set_global_steps(global_steps)`，使 donor 生成结果
+带上当前参数版本。该修复只补齐 D3 测试交接路径，不修改原生 verl 的 batch 逻辑。

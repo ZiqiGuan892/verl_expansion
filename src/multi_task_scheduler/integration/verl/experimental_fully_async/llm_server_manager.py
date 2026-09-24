@@ -90,9 +90,9 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         return [by_rank[rank] for rank in sorted(requested)]
 
     @staticmethod
-    async def _test_memory_call(replica, method: str) -> None:
-        """Call an opt-in memory fixture on every node of one test replica."""
-        await asyncio.gather(*(getattr(server, method).remote() for server in replica.servers))
+    async def _test_memory_call(replica, method: str, *args) -> None:
+        """Call an opt-in runtime fixture on every node of one test replica."""
+        await asyncio.gather(*(getattr(server, method).remote(*args) for server in replica.servers))
 
     async def get_replica_for_ce(self, replica_rank: int):
         """Return the local borrowed replica projection for Trainer CE wiring."""
@@ -119,7 +119,7 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         replica.serving_version = version
         return {"replica_rank": replica_rank, "serving_version": version}
 
-    async def cleanup_d3_runtime(self, replica_rank: int) -> dict:
+    async def cleanup_d3_runtime(self, replica_rank: int, global_steps: int | None = None) -> dict:
         """Clean only the temporary D3 borrowed actors after CE checks."""
         record = self._borrowed_record_by_rank(replica_rank)
         replica = record.get("replica")
@@ -131,6 +131,11 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         cleanup = await replica._cleanup_runtime()
         for donor in record.get("sleeping_donors", []):
             await self._test_memory_call(donor, "wake_for_runtime_test")
+            if global_steps is not None:
+                # Donors were excluded from the CE topology while the
+                # borrowed worker occupied their physical slots.  Restore the
+                # serving tag explicitly before generation resumes.
+                await self._test_memory_call(donor, "set_global_steps", int(global_steps))
         record["sleeping_donors"] = []
         self.rollout_replicas = [item for item in self.rollout_replicas if item is not replica]
         record["state"] = "DESTROYED"

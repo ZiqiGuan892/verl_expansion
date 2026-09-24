@@ -112,7 +112,7 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
                     pass
             if prepared is not None and replica_rank is not None:
                 try:
-                    await self.rollouter.cleanup_d3_runtime.remote(replica_rank)
+                    await self.rollouter.cleanup_d3_runtime.remote(replica_rank, self.current_param_version)
                 except Exception:
                     pass
             if self._d3_suspended_donor_ranks:
@@ -155,7 +155,7 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
                 raise RuntimeError(f"D3 full sync did not update borrowed replica: {full_sync}")
             if self._d3_cleanup_after_test:
                 await self.unregister_replica(rank)
-                cleanup = await self.rollouter.cleanup_d3_runtime.remote(rank)
+                cleanup = await self.rollouter.cleanup_d3_runtime.remote(rank, self.current_param_version)
                 await self.checkpoint_manager.resume_replicas_for_sync(self._d3_suspended_donor_ranks)
                 self._d3_bootstrap_result["cleanup"] = cleanup
                 self._d3_suspended_donor_ranks = []
