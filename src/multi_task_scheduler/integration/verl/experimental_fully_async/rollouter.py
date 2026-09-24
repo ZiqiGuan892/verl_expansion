@@ -86,6 +86,35 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
             "sleeping_donor_ranks": result.get("sleeping_donor_ranks", []),
         }
 
+    async def create_borrowed_replica(self, spec: dict) -> dict:
+        """Thin TaskRunner-facing forwarder to the local runtime manager."""
+        return await self.llm_server_manager.create_borrowed_replica(spec)
+
+    async def commit_replica_ready(self, replica_rank: int) -> dict:
+        """Thin forwarder for the manager-owned LB READY commit."""
+        return await self.llm_server_manager.commit_replica_ready(replica_rank)
+
+    async def prepare_d4_runtime_smoke(self, scenario: str = "split") -> dict:
+        """Build a real-placement D4 test spec without creating a runtime.
+
+        The method exists only for the main_ppo smoke entry.  Production
+        callers receive an already-authorized spec from GS and never invoke
+        this helper or invent placement claims locally.
+        """
+        spec, expected_failure = await self.llm_server_manager._build_d2_test_spec(scenario)
+        sleeping = {"state": "NOT_REQUIRED", "replica_ranks": []}
+        if not expected_failure:
+            sleeping = await self.llm_server_manager.sleep_d4_test_donors(spec)
+        return {"spec": spec, "expected_failure": expected_failure, "sleeping": sleeping}
+
+    async def probe_replica_ready(self, replica_rank: int) -> dict:
+        """Verify the borrowed primary endpoint is present in the LB route table."""
+        return await self.llm_server_manager.probe_replica_ready(replica_rank)
+
+    async def cleanup_d4_runtime(self, replica_rank: int) -> dict:
+        """Run test-only route removal and actor cleanup after D4 smoke."""
+        return await self.llm_server_manager.cleanup_d4_runtime(replica_rank)
+
     async def get_borrowed_replica_for_ce(self, replica_rank: int):
         """Return one manager-owned borrowed replica to the Trainer actor."""
         return await self.llm_server_manager.get_replica_for_ce(replica_rank)

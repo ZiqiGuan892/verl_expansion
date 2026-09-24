@@ -47,6 +47,8 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         self.retired_replica_ranks: set[int] = set()
         self.borrowed_operations: dict[str, dict] = {}
         self.replica_operation_lock = asyncio.Lock()
+        self.ready_replica_ranks: set[int] = set()
+        self._d4_test_sleeping_donors: dict[str, list] = {}
 
     async def _init_global_load_balancer(self) -> None:
         # Native code forwards full_determinism only to its exact default class.
@@ -105,8 +107,8 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             raise ValueError("replica_rank must be a non-negative integer")
         record = self._borrowed_record_by_rank(replica_rank)
         replica = record.get("replica")
-        if replica is None or record.get("state") != "RUNTIME_READY":
-            raise RuntimeError(f"borrowed replica {replica_rank} is not RUNTIME_READY")
+        if replica is None or record.get("state") not in {"RUNTIME_READY", "LB_READY"}:
+            raise RuntimeError(f"borrowed replica {replica_rank} is not ready for CE access")
         return replica
 
     async def register_borrowed_replica_for_ce(self, replica_rank: int) -> dict:
@@ -120,9 +122,140 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         """Persist CE's confirmed version on the manager-owned replica object."""
         if isinstance(version, bool) or not isinstance(version, int) or version < 0:
             raise ValueError("version must be a non-negative integer")
+        record = self._borrowed_record_by_rank(replica_rank)
         replica = await self.get_replica_for_ce(replica_rank)
         replica.serving_version = version
+        record["serving_version"] = version
         return {"replica_rank": replica_rank, "serving_version": version}
+
+    async def commit_replica_ready(self, replica_rank: int) -> dict:
+        """Publish one bootstrapped borrowed primary server to the local LB.
+
+        The manager validates the local runtime and serving version first.  The
+        LB owns the actual route table and performs an idempotent ``commit_ready``
+        mutation; this method only records the serializable operation result.
+        """
+        if isinstance(replica_rank, bool) or not isinstance(replica_rank, int) or replica_rank < 0:
+            raise ValueError("replica_rank must be a non-negative integer")
+        async with self.replica_operation_lock:
+            record = self._borrowed_record_by_rank(replica_rank)
+            replica = record.get("replica")
+            state = record.get("state")
+            if state == "LB_READY":
+                return copy.deepcopy(record["result"])
+            if state != "RUNTIME_READY" or replica is None:
+                raise RuntimeError(f"replica {replica_rank} is not RUNTIME_READY: {state}")
+            serving_version = getattr(replica, "serving_version", None)
+            if isinstance(serving_version, bool) or not isinstance(serving_version, int) or serving_version < 0:
+                raise RuntimeError(f"replica {replica_rank} has no confirmed serving version")
+            server_id = getattr(replica, "_server_address", None)
+            server_handle = getattr(replica, "_server_handle", None)
+            if not isinstance(server_id, str) or not server_id or server_handle is None:
+                raise RuntimeError(f"replica {replica_rank} has no primary server endpoint")
+            record["state"] = "READY_COMMITTING"
+
+        try:
+            lb_result = await self.global_load_balancer.commit_ready.remote(
+                servers={server_id: server_handle}
+            )
+        except Exception as exc:
+            async with self.replica_operation_lock:
+                record["state"] = "RUNTIME_READY"
+                record["error"] = {"code": "LB_READY_FAILED", "message": str(exc)}
+            raise
+
+        async with self.replica_operation_lock:
+            if server_id not in self.server_addresses:
+                self.server_addresses.append(server_id)
+                self.server_handles.append(server_handle)
+            if replica not in self.rollout_replicas:
+                self.rollout_replicas.append(replica)
+            record["state"] = "LB_READY"
+            record["lb_server_id"] = server_id
+            record["serving_version"] = serving_version
+            self.ready_replica_ranks.add(replica_rank)
+            record["result"] = {
+                "operation_id": record["operation_id"],
+                "lease_id": record["lease_id"],
+                "lease_ids": list(record["source_lease_ids"]),
+                "replica_rank": replica_rank,
+                "state": "LB_READY",
+                "released": False,
+                "serving_version": serving_version,
+                "server_id": server_id,
+                "lb": copy.deepcopy(lb_result),
+                "error": None,
+            }
+            return copy.deepcopy(record["result"])
+
+    async def sleep_d4_test_donors(self, spec: dict) -> dict:
+        """Release donor memory for the opt-in D4 smoke only.
+
+        Production donor sleep is owned by the lifecycle implementation.  The
+        helper keeps actor handles local to this manager so the later test
+        cleanup can restore them without putting handles in a receipt.
+        """
+        donors = self._local_native_donors(spec)
+        slept = []
+        try:
+            for donor in donors:
+                await self._test_memory_call(donor, "sleep_for_runtime_test")
+                slept.append(donor)
+        except Exception:
+            # A partial fixture must not leave the remaining training engine
+            # asleep when the borrowed runtime was never created.
+            for donor in reversed(slept):
+                try:
+                    await self._test_memory_call(donor, "wake_for_runtime_test")
+                except Exception:
+                    pass
+            raise
+        self._d4_test_sleeping_donors[spec["lease_id"]] = donors
+        return {"state": "TEST_DONORS_SLEEPING", "replica_ranks": [int(d.replica_rank) for d in donors]}
+
+    async def cleanup_d4_runtime(self, replica_rank: int) -> dict:
+        """Remove a D4 test route, then reuse the D3-only actor cleanup hook."""
+        record = self._borrowed_record_by_rank(replica_rank)
+        server_id = record.get("lb_server_id")
+        if server_id and getattr(self, "global_load_balancer", None) is not None:
+            # This is test teardown after the process exits its training loop;
+            # production removal must use a future drain/commit_remove flow.
+            await self.global_load_balancer.remove_servers.remote(server_ids=[server_id])
+            if server_id in self.server_addresses:
+                index = self.server_addresses.index(server_id)
+                self.server_addresses.pop(index)
+                self.server_handles.pop(index)
+            self.ready_replica_ranks.discard(replica_rank)
+        if not record.get("sleeping_donors"):
+            # Creation failures do not reach the success block that transfers
+            # this list into the operation record.  Consume the fixture-owned
+            # map here so a failed smoke still restores donor memory.
+            donors = self._d4_test_sleeping_donors.pop(record["lease_id"], [])
+            for donor in donors:
+                await self._test_memory_call(donor, "wake_for_runtime_test")
+        return await self.cleanup_d3_runtime(replica_rank)
+
+    async def probe_replica_ready(self, replica_rank: int) -> dict:
+        """Check endpoint health and LB registration without sending a prompt."""
+        record = self._borrowed_record_by_rank(replica_rank)
+        if record.get("state") != "LB_READY":
+            raise RuntimeError(f"replica {replica_rank} is not LB_READY")
+        replica = record.get("replica")
+        server_id = record.get("lb_server_id")
+        server_handle = getattr(replica, "_server_handle", None)
+        if server_handle is None or not server_id:
+            raise RuntimeError(f"replica {replica_rank} has no published primary server")
+        address = await server_handle.get_server_address.remote()
+        server_ids = await self.global_load_balancer.get_all_servers.remote()
+        if server_id not in server_ids:
+            raise RuntimeError(f"LB does not contain committed server {server_id}")
+        return {
+            "replica_rank": replica_rank,
+            "state": "LB_READY",
+            "server_id": server_id,
+            "endpoint": address,
+            "registered": True,
+        }
 
     async def cleanup_d3_runtime(self, replica_rank: int, global_steps: int | None = None) -> dict:
         """Clean only the temporary D3 borrowed actors after CE checks."""
@@ -521,6 +654,7 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             record["worker_handles"] = list(replica.workers)
             record["server_handles"] = list(replica.servers)
             record["created_actor_names"] = list(replica.created_actor_names)
+            record["sleeping_donors"] = self._d4_test_sleeping_donors.pop(lease_id, [])
             record["result"] = {
                 "operation_id": record["operation_id"],
                 "lease_id": record["lease_id"],

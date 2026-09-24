@@ -7,6 +7,7 @@ The separate native_unit layer covers imports and actual parent relationships.
 
 import ast
 import asyncio
+import threading
 import logging
 from pathlib import Path
 from types import SimpleNamespace
@@ -53,6 +54,7 @@ def test_task_runner_creation_preserves_roles_arguments_and_initialization_order
         ray=SimpleNamespace(get=lambda result: result), Role=role,
         MultiTaskFullyAsyncTrainer=trainer_class, MultiTaskFullyAsyncRollouter=rollouter_class,
         create_resource_pool_manager=pool_factory,
+        threading=threading,
     )
     runner = test_class()
     runner.group_scheduler = object()
@@ -104,6 +106,7 @@ def test_runner_attaches_real_chain_reference_before_native_run_and_detaches_aft
                             get_runtime_context=lambda: SimpleNamespace(get_actor_id=lambda: "task-a",
                                                                          current_actor=task_handle)),
         get_or_create_group_scheduler=lambda: scheduler, logger=logging.getLogger(__name__),
+        threading=threading,
     )
     runner = runner_class()
     if native_failure:

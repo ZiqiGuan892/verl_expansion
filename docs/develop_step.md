@@ -4,7 +4,8 @@
 
 本版取代旧计划的 D00—D14。D0 与历史 D00 是同一步；交接文件中的“D01 尚未获准开始”，对应本版 D1 的进入门禁。旧计划中的全量生命周期实现不再是本轮交付目标。
 
-**当前状态：D0、D1 已由用户确认验收通过；D2 的 split、fragmented、missing_pg、cross_pg 真实场景已通过；D3 代码、单元测试和真实 main_ppo 测试入口已完成，详细记录在 [D3_develop.md](D3_develop.md)，等待服务器运行 `D3_test.sh` 留存 CE bootstrap 证据。D4 未开始。**
+**当前状态：D0、D1、D2、D3 已由用户确认验收通过；D4 阶段代码已完成，但 D0–D4 综合验收仍需按
+[综合验收测试设计](comprehensive_acceptance_test.md) 执行；D4 的开发记录见 [D4_develop.md](D4_develop.md)。**
 
 ## 1. 本轮范围与实现边界
 
@@ -38,7 +39,7 @@
 | D1：创建契约与本地管理 | spec 校验、身份分配、幂等记录和预留接口 | `llm_server_manager.py`、`rollout/replica.py` | 非法输入无副作用；重复请求不产生重复 rank/runtime；返回值不泄漏 handles |
 | D2：borrowed runtime 创建 | 显式 PG/bundle → CE Workers → HTTP server/engine，达到 RUNTIME_READY；CE 注册、bootstrap、LB 接流留空 | `rollout/replica.py`、manager、Rollouter 测试 hook、D2 runtime 脚本 | 真实放置正确；拆分、拼接、碎片化、多 claim 和失败清理可验证；borrower 不创建或删除 donor PG |
 | D3：CE 注册与首次同步 | target-only bootstrap、版本确认、后续全成员同步与成员注销 | `checkpoint_engine_manager.py`、`trainer.py` | 新 replica 真正加载 borrower 权重；已有服务不被 bootstrap 中断；通信域完成 finalize |
-| D4：任务入口与接流 | TaskRunner 编排创建、Rollouter 薄转发、LB READY 和最终回执 | `task_runner.py`、`rollouter.py`、manager、`load_balancer.py` | 训练期间可执行创建；新 replica 在确认权重后收到并完成请求；GS 只接收元数据 |
+| D4：任务入口与接流 | TaskRunner 编排创建、Rollouter 薄转发、LB READY 和最终回执 | `task_runner.py`、`rollouter.py`、manager、`load_balancer.py` | 训练期间可执行创建；确认权重后 endpoint 可查询且已登记到 LB；GS 只接收元数据 |
 
 顺序固定为 **D0 → D1 → D2 → D3 → D4**。不并行开发尚未获用户确认的后续阶段，也不新增单独的“最终测试阶段”；对应功能的真实验证在所属阶段完成，D4 只补齐端到端连接与回归。
 
@@ -142,16 +143,20 @@
 | --- | --- | --- |
 | 句柄和并发边界 | 清除 Rollouter、manager、LB 的 GS 构造参数和成员，只由 TaskRunner 注册/注销 GS；实现训练 run 期间仍可执行管理方法的并发入口 | 真实 CPU Ray 验证长时间 run 不阻塞管理请求；组件未初始化时明确拒绝；训练异常/退出仍注销；非 TaskRunner 组件不持有 GS |
 | 创建调用链 | TaskRunner 的 execute_replica_operation(create, request) 调 Rollouter 薄转发 → manager 返回 RUNTIME_READY → Trainer register → bootstrap → Rollouter/manager 提交 READY | Rollouter 不解析 PG、不直接操作 CE；中间回执与最终成功明确区分；同 lease 的重复命令不会重复创建或重复启动并发 bootstrap |
-| LB 提交 | 在现有 Rollouter/manager 内补齐任务内部的 READY 提交入口，将 CE 确认结果显式写回本地 serving_version；校验 lease、健康和版本后调用 LB commit_ready，仅发布主 server，再更新可服务并发额度 | bootstrap 前不可获取新 server；bootstrap 后请求能到达新 engine；重复 READY 不重置已有计数/粘性路由，也不把 headless server 加入 HTTP 路由 |
+| LB 提交 | 在现有 Rollouter/manager 内补齐任务内部的 READY 提交入口，将 CE 确认结果显式写回本地 serving_version；校验 lease、健康和版本后调用 LB commit_ready，仅发布主 server，再更新可服务并发额度 | bootstrap 前不可获取新 server；bootstrap 后 endpoint 可查询且 server 出现在 LB；重复 READY 不重置已有计数/粘性路由，也不把 headless server 加入 HTTP 路由 |
 | 结果及失败 | TaskRunner 向 GS 返回可序列化 receipt；GS 不获取 replica/CE/server/PG handles；在 runtime、bootstrap、LB 各边界注入失败或 lease 失效 | 任一前置失败不发布 READY、不增加并发；LB 提交结果不确定时核对路由实际状态再重试/报告，不能仅凭 RPC 超时宣告成功或失败；未确认清理时 released=False |
 
 本阶段补齐 TaskRunner/Rollouter/server 中设计要求的非创建预留接口；不借此实现 begin_drain、请求迁移、完整 commit_remove 或 sleep/reclaim/destroy 编排。CE unregister 已在 D3 验证，但它不代表物理资源已经回收。
 
-**验收文件：** 计划新增 `tests/integration/test_replica_command_entry.py`、`tests/gpu/test_borrowed_create_e2e.py`，按需要扩充已有 wiring/LB 单元测试。
+**验收文件：** 已新增 `tests/unit/test_d4_lifecycle.py` 和 `D4_test.sh`；前者验证命令顺序与 READY 幂等，后者从 main_ppo 进入真实 Ray/GPU 链路。
 
-**真实验收：** 在隔离 Ray 集群中保持 donor PG owner 存活，由 GS 测试入口向 borrower TaskRunner 下发明确 spec；观察完整创建、当前窗口 bootstrap、新 server 接收请求、随后一次普通同步。复用 D2 已验证的 placement 场景，不重复实现测试专用创建器。对重复命令、租约失效和局部失败分别留存证据；结束后核对并清理本次测试拥有的资源。
+**当前本地验证：** D4 及 D1-D3 相关回归共 `41 passed`；本机完整 `tests/unit` 仍因缺少
+`omegaconf` 无法收集 `test_entry.py` 与 `test_runtime_profile.py`，不能替代服务器上的真实
+main_ppo 验证。
 
-**通过条件：** GS → TaskRunner → runtime → CE → LB 的创建链路可重复运行，普通训练和已有 replica 服务保持正确，故障不被误报成功。用户确认 D4 后，本轮“创建能力及生命周期预留接口”完成；完整 sleep/wake/reclaim/destroy 需另行设计、授权和验收。
+**真实验收：** 运行 `D4_test.sh`，由 main_ppo 的 TaskRunner 调用同一创建入口，观察 runtime、CE bootstrap、LB READY 和 endpoint probe。复用 D2 已验证的 placement 场景，不重复实现生产创建器。对重复命令、租约失效和局部失败的单元证据分别留存；测试结束使用 D4 专用 teardown 清理本次 Actor/路由。
+
+**通过条件：** TaskRunner → runtime → CE → LB 的创建链路可重复运行，返回 `LB_READY` 和可查询 endpoint，故障不被误报成功。四个真实 placement 场景均通过后，用户可确认 D4；完整 sleep/wake/reclaim/destroy 需另行设计、授权和验收。
 
 ## 4. 验证环境、命令与证据
 
@@ -211,7 +216,7 @@ GPU 配置填写 namespace、Ray 地址、原生配置和模型路径、节点/�
 - 失败与限制：已知问题、保留资源、恢复/测试清理结果。
 - 用户确认：确认时间或原话；没有确认则不得进入下一阶段。
 
-**本次计划修订：** 以最新版设计替换旧 D00—D14，合并为 D0—D4；加入异构 world_size、碎片化 bundle、多 claim 和 target-only bootstrap 的阶段验收；将完整生命周期实现移出本轮。仅修改本文，不修改代码、不执行运行时测试、不将任何阶段标记为新通过。
+**本次计划修订：** 以最新版设计替换旧 D00—D14，合并为 D0—D4；加入异构 world_size、碎片化 bundle、多 claim 和 target-only bootstrap 的阶段验收；将完整生命周期实现移出本轮。D4 只补齐 TaskRunner 创建入口和 LB READY 边界，完整 sleep/wake/reclaim/destroy 仍留待后续授权。
 
 以下 D00 日志原文保留，其中旧编号、环境描述和检查结果均为当时记录，不代表本次重新验证；D00 即本版 D0。
 
