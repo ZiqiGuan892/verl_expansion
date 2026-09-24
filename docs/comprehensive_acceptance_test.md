@@ -296,7 +296,9 @@ MULTITASK_TRAINING_COMPLETE {"state": "COMPLETED", "completed": true,
 每个 named tensor 时记录 name、shape、dtype、numel 和 SHA-256，Manager 比较所有接收
 Worker 的完整 manifest，并核对本次冻结的参数版本。只看到 `WEIGHTS_READY` 或
 `FULL_SYNC_READY` 而没有逐参数 manifest，不能证明参数内容一致。该校验默认关闭，D0、D3、
-D4 验收脚本显式打开，因为逐参数 hash 会增加同步开销。
+D4 验收脚本显式打开，因为逐参数 hash 会增加同步开销。当前 MVP 比对的是 CE 接收流和
+各 CE Worker 之间的一致性；若要证明 actor 源模型的绝对等价，还需要增加发送端 source
+manifest，这不属于本次批量验收改动。
 
 ## 8. 一键综合脚本实现
 

@@ -325,3 +325,8 @@ bootstrap 或普通同步收尾时比较所有 CE Worker 的完整 manifest，�
 `global_steps`，成功后输出 `CE_PARAMETER_VALIDATION`。该开关默认关闭，因为逐参数 hash
 会增加同步开销；D0/D3/D4 验收脚本显式打开。`delta_flush` 暂不支持完整 manifest 校验，
 开启严格校验时会明确失败，不能伪报成功。
+
+这项 MVP 校验的是 CE 接收流的逐参数完整性、各接收 Worker 之间的一致性以及版本号；
+它不会把完整模型副本回传 driver 再与 actor 逐参数重算。若后续需要证明 actor 源模型与
+接收值的绝对相等，应在发送端增加同格式的 source manifest，再由 Manager 做 source-to-receiver
+比对。
