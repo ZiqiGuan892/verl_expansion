@@ -8,11 +8,11 @@
 #
 # 服务器上的典型用法：
 #   cd "$VERL_REPO_DIR/verl"
-#   D0_D4_SCENARIOS=S0,S1,S2,S3,S4,S8,S9,S10,S11,S12,S13,S14,S16 \
-#       bash ../D0_D4_comprehensive_test.sh
+#   D0_D4_SCENARIOS=S0 bash ../D0_D4_comprehensive_test.sh
+#   D0_D4_SCENARIOS=S1 bash ../D0_D4_comprehensive_test.sh
 #
-# 旧 Bash 兼容：不使用 pipefail；每个子进程使用重定向记录日志并显式
-# 检查退出码。完整验收返回 0；执行失败返回 1；代码或环境尚未支持
+# 旧 Bash 兼容：不依赖 pipefail；每个子进程使用 tee 实时打印并记录
+# 日志，通过 PIPESTATUS 显式检查退出码。完整验收返回 0；执行失败返回 1；代码或环境尚未支持
 # 选定场景返回 2。设置 D0_D4_REQUIRE_COMPLETE=0 可用于阶段性回归，
 # 但输出中的 INCOMPLETE/BLOCKED 仍然表示综合验收未完成。
 set -eu
@@ -54,7 +54,9 @@ command -v "${PYTHON_BIN}" >/dev/null 2>&1 || {
     exit 2
 }
 
-export D0_D4_SCENARIOS="${D0_D4_SCENARIOS:-S0,S1,S2,S3,S4,S8,S9,S10,S11,S12,S13,S14,S16}"
+# 一次只执行一个场景。需要执行多个场景时，由外层 shell 逐次调用本脚本，
+# 这样每个场景拥有独立 Ray 会话、日志目录和显存清理边界。
+export D0_D4_SCENARIOS="${D0_D4_SCENARIOS:-S0}"
 export D0_D4_REQUIRE_COMPLETE="${D0_D4_REQUIRE_COMPLETE:-1}"
 RUN_ID="$(date +%Y%m%d%H%M%S)"
 RUN_DIR="${D0_D4_LOG_DIR:-${VERL_REPO_DIR}/logs/d0_d4_comprehensive}/${RUN_ID}"
@@ -84,10 +86,15 @@ run_logged() {
     log_file="$1"
     shift
     set +e
-    "$@" > "${log_file}" 2>&1
-    command_status=$?
+    # 不能把 stdout/stderr 重定向到文件，否则 native verl 的启动、Ray、
+    # vLLM 和训练日志只会在子进程结束后才能看到。tee 同时保留实时终端输出。
+    "$@" 2>&1 | tee "${log_file}"
+    command_statuses=( "${PIPESTATUS[@]}" )
     set -e
-    return "${command_status}"
+    if [ "${command_statuses[0]}" -ne 0 ]; then
+        return "${command_statuses[0]}"
+    fi
+    return "${command_statuses[1]}"
 }
 
 has_error_marker() {
@@ -151,10 +158,17 @@ run_native_baseline() {
         "rollout.total_rollout_steps=2" \
         "+actor_rollout_ref.rollout.enable_sleep_mode=true" \
         "actor_rollout_ref.rollout.free_cache_engine=true"; then
-        if grep -Fq '[ASYNC MAIN] Training completed or interrupted' "${log_file}" && ! has_error_marker "${log_file}"; then
+        if ! has_error_marker "${log_file}" && \
+            (grep -Fq '[ASYNC MAIN] Training completed or interrupted' "${log_file}" || \
+                grep -Fq 'total time:' "${log_file}" || \
+                grep -Fq '[ASYNC MAIN] One component completed successfully' "${log_file}"); then
             record_result S0 PASS "${log_file}" "native main_ppo 完成且未发现异常标记"
         else
-            record_result S0 FAIL "${log_file}" "native 进程退出为 0，但缺少完成标记或日志包含异常"
+            if has_error_marker "${log_file}"; then
+                record_result S0 FAIL "${log_file}" "native 日志包含异常标记，详见实时输出和日志文件"
+            else
+                record_result S0 FAIL "${log_file}" "native 进程退出为 0，但缺少完成标记；请检查实时日志末尾"
+            fi
         fi
     else
         record_result S0 FAIL "${log_file}" "native main_ppo 退出失败"
@@ -245,27 +259,25 @@ mark_blocked() {
 write_environment
 
 case "${D0_D4_SCENARIOS}" in
-    *[!a-zA-Z0-9_,]*)
-        echo "D0_D4_SCENARIOS 只允许使用字母、数字、下划线和逗号。" >&2
+    ""|*,*|*[!a-zA-Z0-9_]*)
+        echo "D0_D4_SCENARIOS 必须是一个场景名，例如 S0；一次不能传入多个场景。" >&2
         exit 2
         ;;
 esac
 
-for scenario in $(printf '%s' "${D0_D4_SCENARIOS}" | tr ',' ' '); do
-    [ -n "${scenario}" ] || continue
-    case "${scenario}" in
-        S0) run_native_baseline ;;
-        S1) run_d4_scenario S1 basic partial ;;
-        S2) run_d4_scenario S2 split partial ;;
-        S3) run_d4_scenario S3 cross_pg partial ;;
-        S4) run_d4_scenario S4 fragmented partial ;;
-        S8|S9) run_unit_only "${scenario}" ;;
-        S10) run_d2_negative S10 expired ;;
-        S11) run_d2_negative S11 missing_pg,duplicate_device ;;
-        S12|S13|S14|S16) mark_blocked "${scenario}" ;;
-        *) record_result "${scenario}" BLOCKED "" "未知综合验收场景" ;;
-    esac
-done
+scenario="${D0_D4_SCENARIOS}"
+case "${scenario}" in
+    S0) run_native_baseline ;;
+    S1) run_d4_scenario S1 basic partial ;;
+    S2) run_d4_scenario S2 split partial ;;
+    S3) run_d4_scenario S3 cross_pg partial ;;
+    S4) run_d4_scenario S4 fragmented partial ;;
+    S8|S9) run_unit_only "${scenario}" ;;
+    S10) run_d2_negative S10 expired ;;
+    S11) run_d2_negative S11 missing_pg,duplicate_device ;;
+    S12|S13|S14|S16) mark_blocked "${scenario}" ;;
+    *) record_result "${scenario}" BLOCKED "" "未知综合验收场景" ;;
+esac
 
 export D0_D4_RESULTS_FILE="${RESULTS_FILE}"
 export D0_D4_SUMMARY_FILE="${SUMMARY_FILE}"

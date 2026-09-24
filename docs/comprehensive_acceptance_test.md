@@ -211,6 +211,32 @@ READY 前调用 acquire_server，必须失败或看不到新 borrowed server。R
 | S15 | 多任务借用 | Task A donor、Task B borrower、GS 授权 claims | borrower 不持 donor handle；两任务可继续 | 当前 smoke 是同 manager 本地 donor |
 | S16 | 请求压力边界 | READY 后并发多个 request | inflight、sticky 路由、释放计数和输出 | 当前未覆盖真实生成压力 |
 
+### 5.1 各场景实际执行步骤与当前可测试性
+
+下面的“实际步骤”描述当前仓库中的脚本真正执行的调用链，不是目标架构中的理想流程。`可直接执行`表示当前 1 节点 8 卡、4 张训练 NPU 加 4 张 rollout NPU 的机器具备入口；`可执行但不完整`表示能启动已有阶段测试，但不能证明该场景的全部验收条件；`不可执行`表示当前没有对应测试入口或硬件条件。
+
+| 场景 | 当前脚本实际经历的步骤 | 当前条件下的结论 |
+| --- | --- | --- |
+| S0 | `D0_D4_comprehensive_test.sh` → `multi_task_run.sh` → native `main_ppo`；创建原生训练/rollout 资源，执行 native rollout、训练和原生参数同步，进程退出后检查日志。 | **可直接执行**。可以证明 native baseline 可运行，但当前脚本没有导出结构化 native inventory，也不能证明 borrowed 生命周期。 |
+| S1 | `D4_test.sh basic`；native replica 初始化 → 从真实 PG/bundle/device 构造 spec → 测试辅助 sleep donor engine → 从 CE effective set 暂停 donor → 创建 borrowed CE Worker、HTTP Server、vLLM Engine → CE 注册 → target-only bootstrap → LB `commit_ready` → endpoint/LB 查询 → 移除测试路由 → kill borrowed Actor → 测试辅助 wake donor → 恢复 donor CE membership。 | **可执行但不完整**。创建、CE bootstrap、LB_READY 和测试清理可执行；没有真实 generate、样本生产期间的普通参数同步、生产 reclaim/destroy。 |
+| S2 | 与 S1 相同，但 `_build_d2_test_spec("split")` 只取一个 donor 的部分 claims，创建一个 world_size=2 的 borrowed replica。 | **可执行但不完整**。验证了 4 卡 donor → 2 卡 borrower 的部分拆分；没有验证一个 donor 同时拆成两个 borrower。 |
+| S3 | `D4_test.sh cross_pg` 将 rollout TP 调为 2，先创建两个较小的 native PG，再从不同 PG 各取一个 claim，重编号后创建一个跨 PG borrowed runtime，执行 CE bootstrap、LB_READY、endpoint 检查和测试清理。 | **可执行但不完整**。验证了跨 PG claim；当前并不是两个 world_size=2 donor 合成为一个 world_size=4 borrower。 |
+| S4 | 与 S1 相同，但选择 `source_claims[::2]` 形成非连续 bundle，随后执行真实 Worker/Server/Engine 创建、CE bootstrap、LB_READY、endpoint 检查和测试清理。 | **可执行但不完整**。可以验证单个碎片化 placement；缺少真实生成和后续普通同步。 |
+| S5 | 当前综合脚本没有创建入口；代码中只有 `max_colocate_count`/fractional placement 约束，未建立多个同 bundle CE Worker 的真实 HCCL 切换测试。 | **不可直接执行**。同卡多 Engine 还受显存和 HCCL 单物理设备单 active rank 约束，不能仅凭 Ray placement 判定通过。 |
+| S6 | 当前没有跨节点启动器或多节点资源配置；不能进入真实多节点 PG、node rank 和 HCCL 通信域验证。 | **不可执行**。当前只有 1 个节点。 |
+| S7 | S2 可部分覆盖 4→2，S3 可部分覆盖跨 PG claim，但综合脚本没有独立的异构 world_size 场景，也没有完整 2+2→4 组合。 | **只能部分执行**，不能作为异构 world_size 完整验收。 |
+| S8 | 综合脚本调用 `D2_test.sh` 的契约单元测试，检查相同 lease/spec 的幂等字段和 receipt 行为；不启动真实 borrowed runtime。 | **只能单元测试**。真实 Ray 重试、同一 lease 只保留一组 Worker/Engine 的验证尚未接入。 |
+| S9 | 综合脚本同样只调用 D2/D1 单元测试；没有两个真实 Ray caller 并发调用 TaskRunner 的 harness。 | **只能单元测试**。真实并发 duplicate create 尚不能验证。 |
+| S10 | `D2_runtime_test.sh expired`；native 初始化 → 构造已过期 spec → 在创建 Worker 前被 placement/lease 校验拒绝 → 输出 `EXPECTED_FAILURE` → 主训练流程继续并清理 native 资源。 | **可直接执行**。可以验证 expired lease 不进入 `RUNTIME_READY`；不能替代完整 lease 冲突重试测试。 |
+| S11 | `D2_runtime_test.sh missing_pg,duplicate_device`；native 初始化 → 构造缺失 PG 或重复设备的 spec → 创建前校验失败 → 输出预期失败 receipt → 检查没有发布 borrowed runtime。 | **可直接执行**。可以验证两类 placement 负例；Worker 中途失败、OOM、端口冲突仍没有真实注入。 |
+| S12 | 当前没有第 N 个 Worker 失败、Engine OOM、端口冲突或启动超时的可控注入参数。 | **不可执行**。不能用一次自然 OOM 代替可重复的故障验收。 |
+| S13 | 当前没有让 CE register、target-only bootstrap、通信域 finalize 或目标 Worker 更新可控失败的 main_ppo 入口。 | **不可执行**。已有 CE 单元测试不能证明真实 HCCL 失败后的资源状态。 |
+| S14 | 当前没有让 LB `commit_ready`/remove RPC 在写入后丢失响应的测试代理，也没有查询后幂等重试入口。 | **不可执行**。不能证明 LB 不确定提交的最终路由一致性。 |
+| S15 | 当前 D4 smoke 的 donor 和 borrower 都属于同一个 TaskRunner/LLMServerManager；没有两个独立任务、GS 授权快照和跨任务 RPC 启动器。 | **不可执行**。不能证明 borrower 不持有 donor 句柄或跨任务继续运行。 |
+| S16 | D4 只调用 `get_server_address` 和 `get_all_servers` 检查 endpoint/LB 名录，没有通过客户端发送 prompt，也没有并发请求驱动器。 | **不可执行**。不能验证真实样本、inflight 计数、sticky 路由或压力下的释放。 |
+
+因此，当前机器上可以逐个直接运行 `S0、S1、S2、S3、S4、S10、S11`；其中 S1–S4 是阶段链路验证，严格综合验收仍应标记为 `INCOMPLETE`。S8、S9 只能得到单元测试证据，S5、S6、S12–S16 不能在当前实现和硬件条件下直接完成综合验收。
+
 ## 6. 故障注入与不变量
 
 | 故障点 | 注入方法 | 必须成立的结果 |
@@ -257,7 +283,7 @@ stderr.log
 
 ## 8. 一键综合脚本实现
 
-已新增 `D0_D4_comprehensive_test.sh`。脚本不是简单地把阶段脚本的退出码相加，而是为每个场景生成独立日志、`environment.json`、`results.tsv` 和 `summary.json`，并区分真实通过、阶段路径通过但证据不足（`INCOMPLETE`）和当前没有实现入口（`BLOCKED`）。
+已新增 `D0_D4_comprehensive_test.sh`。脚本每次只接受一个场景名，不会在同一个 Ray/显存生命周期内串行运行多个场景。它使用 `tee` 将 native verl、Ray、vLLM 和训练日志实时打印到控制台，同时保存独立日志，并生成 `environment.json`、`results.tsv` 和 `summary.json`。结果区分真实通过、阶段路径通过但证据不足（`INCOMPLETE`）和当前没有实现入口（`BLOCKED`）。
 
 当前映射如下：
 
@@ -290,13 +316,19 @@ D2_RUNTIME_SCENARIOS=basic,split,fragmented,cross_pg bash ../D2_runtime_test.sh
 D3_RUNTIME_SCENARIOS=basic,split,fragmented,cross_pg bash ../D3_test.sh
 D4_RUNTIME_SCENARIOS=basic,split,fragmented,cross_pg bash ../D4_test.sh
 
-# 综合脚本（严格模式，默认要求所有选定场景完整）
-D0_D4_SCENARIOS=S0,S1,S2,S3,S4,S8,S9,S10,S11,S12,S13,S14,S16 \
-  bash ../D0_D4_comprehensive_test.sh
+# 综合脚本：每次只运行一个场景
+D0_D4_SCENARIOS=S0 bash ../D0_D4_comprehensive_test.sh
+D0_D4_SCENARIOS=S1 bash ../D0_D4_comprehensive_test.sh
+D0_D4_SCENARIOS=S10 bash ../D0_D4_comprehensive_test.sh
+
+# 如果需要批量运行，必须由外层 shell 逐次启动，每个场景都有独立进程和日志
+for scenario in S0 S1 S2 S3 S4 S10 S11; do
+  D0_D4_SCENARIOS="${scenario}" bash ../D0_D4_comprehensive_test.sh || exit $?
+done
 
 # 只做当前阶段路径回归；仍须查看 summary.json，不能据此宣布综合验收完成
 D0_D4_REQUIRE_COMPLETE=0 \
-D0_D4_SCENARIOS=S0,S1,S2,S3,S4,S10,S11 \
+D0_D4_SCENARIOS=S1 \
   bash ../D0_D4_comprehensive_test.sh
 ```
 
