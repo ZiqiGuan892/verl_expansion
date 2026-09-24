@@ -255,23 +255,32 @@ stderr.log
 
 脚本不能只用 grep 判断 marker 是否出现。应解析 JSON，同时验证状态、错误列表、计数、server ID、版本和清理结果。出现 Traceback、HCCL 错误、OOM、release_confirmed=false 或未知状态时，场景失败。
 
-## 8. 一键综合脚本设计
+## 8. 一键综合脚本实现
 
-建议新增 D0_D4_comprehensive_test.sh，而不是简单串行调用现有 D2、D3、D4 脚本。脚本职责：
+已新增 `D0_D4_comprehensive_test.sh`。脚本不是简单地把阶段脚本的退出码相加，而是为每个场景生成独立日志、`environment.json`、`results.tsv` 和 `summary.json`，并区分真实通过、阶段路径通过但证据不足（`INCOMPLETE`）和当前没有实现入口（`BLOCKED`）。
 
-1. 检查版本、导入路径、设备数量、模型和数据，写入 environment.json；
-2. 启动一次 native baseline，保存真实 inventory；
-3. 在同一 Ray session/隔离 namespace 执行 S1–S5，多节点/多任务的 S6/S15 单独启动对应任务；
-4. 对成功场景执行 create → CE bootstrap → LB READY → generate → normal sync → generate → cleanup；
-5. 对负例只接受预期失败，并检查无 READY、无残留 Actor、无 donor 破坏；
-6. 生成 summary.json，只有全部必选场景通过才返回 0。
+当前映射如下：
+
+| 场景 | 执行入口 | 当前判定 |
+| --- | --- | --- |
+| S0 | `multi_task_run.sh`，不启用 smoke hook | native baseline 成功才为 `PASS` |
+| S1 | `D4_test.sh basic` | 当前 D4 只验证到 LB/endpoint，因此为 `INCOMPLETE` |
+| S2 | `D4_test.sh split` | 只创建一个拆分后的 borrower，尚未验证两个 borrower 同时存在，为 `INCOMPLETE` |
+| S3 | `D4_test.sh cross_pg` | 当前只验证跨 PG claim，尚未验证 2+2 合成 world_size=4，为 `INCOMPLETE` |
+| S4 | `D4_test.sh fragmented` | placement 和 runtime 路径可执行，但缺少真实 generate/后续 sync，为 `INCOMPLETE` |
+| S8、S9 | `D2_test.sh` 契约单元测试 | 只有单元证据，真实重试/并发 RPC 未实现，为 `INCOMPLETE` |
+| S10 | `D2_runtime_test.sh expired` | 预期拒绝且无 READY 才为 `PASS` |
+| S11 | `D2_runtime_test.sh missing_pg,duplicate_device` | placement 负例均按预期失败才为 `PASS` |
+| S12、S13、S14、S16 | 暂无真实故障注入或请求压力入口 | `BLOCKED` |
+
+成功路径必须经由真实 `main_ppo`，并执行现有的 create → CE bootstrap → LB READY → 测试清理链路；脚本不会把未实现的 generate、普通同步、并发或故障注入伪装成通过。多节点/多任务场景仍需额外 harness。
 
 返回值：
 
 ```text
 0  所有选定场景的完整证据通过
 1  任一场景失败、证据缺失或清理未确认
-2  环境/版本/硬件不满足，测试未执行
+2  环境/版本/硬件不满足，或存在 INCOMPLETE/BLOCKED 场景
 ```
 
 现有脚本仍是阶段回归：
@@ -281,8 +290,13 @@ D2_RUNTIME_SCENARIOS=basic,split,fragmented,cross_pg bash ../D2_runtime_test.sh
 D3_RUNTIME_SCENARIOS=basic,split,fragmented,cross_pg bash ../D3_test.sh
 D4_RUNTIME_SCENARIOS=basic,split,fragmented,cross_pg bash ../D4_test.sh
 
-# 综合脚本实现后
+# 综合脚本（严格模式，默认要求所有选定场景完整）
 D0_D4_SCENARIOS=S0,S1,S2,S3,S4,S8,S9,S10,S11,S12,S13,S14,S16 \
+  bash ../D0_D4_comprehensive_test.sh
+
+# 只做当前阶段路径回归；仍须查看 summary.json，不能据此宣布综合验收完成
+D0_D4_REQUIRE_COMPLETE=0 \
+D0_D4_SCENARIOS=S0,S1,S2,S3,S4,S10,S11 \
   bash ../D0_D4_comprehensive_test.sh
 ```
 
