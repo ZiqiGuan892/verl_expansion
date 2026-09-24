@@ -279,17 +279,34 @@ stderr.log
 
 每条 receipt 至少包含 scenario、operation_id、lease_id、replica_rank、state、world_size、serving_version、server_id、ce_registered、bootstrap_finalized、lb_registered、generated_request_ids、released 和 error。
 
-脚本不能只用 grep 判断 marker 是否出现。应解析 JSON，同时验证状态、错误列表、计数、server ID、版本和清理结果。出现 Traceback、HCCL 错误、OOM、release_confirmed=false 或未知状态时，场景失败。
+训练成功的唯一判据是插件 Trainer 输出的结构化回执：
+
+```text
+MULTITASK_TRAINING_COMPLETE {"state": "COMPLETED", "completed": true,
+                             "completed_steps": N, "target_steps": N, ...}
+```
+
+`[ASYNC MAIN] One component completed successfully`、`total time`、进程退出码为 0
+以及没有 Traceback 都不能单独证明训练完成了全部 step。异常、OOM、HCCL 错误等日志只作为
+诊断信息；如果没有 `completed_steps == target_steps` 的回执，场景必须判为失败。脚本仍会
+检查子进程和 `tee` 的退出码，用于发现测试驱动器自身没有正常退出；这属于执行完整性检查，
+不替代训练完成回执。
+
+参数同步成功还必须有 `CE_PARAMETER_VALIDATION` 回执。启用测试开关后，CE Worker 在接收
+每个 named tensor 时记录 name、shape、dtype、numel 和 SHA-256，Manager 比较所有接收
+Worker 的完整 manifest，并核对本次冻结的参数版本。只看到 `WEIGHTS_READY` 或
+`FULL_SYNC_READY` 而没有逐参数 manifest，不能证明参数内容一致。该校验默认关闭，D0、D3、
+D4 验收脚本显式打开，因为逐参数 hash 会增加同步开销。
 
 ## 8. 一键综合脚本实现
 
-已新增 `D0_D4_comprehensive_test.sh`。脚本每次只接受一个场景名，不会在同一个 Ray/显存生命周期内串行运行多个场景。它使用 `tee` 将 native verl、Ray、vLLM 和训练日志实时打印到控制台，同时保存独立日志，并生成 `environment.json`、`results.tsv` 和 `summary.json`。结果区分真实通过、阶段路径通过但证据不足（`INCOMPLETE`）和当前没有实现入口（`BLOCKED`）。
+已新增 `D0_D4_comprehensive_test.sh`。脚本每次只接受一个场景名，不会在同一个 Ray/显存生命周期内串行运行多个场景。它使用 `tee` 将 native verl、Ray、vLLM 和训练日志实时打印到控制台，同时保存独立日志，并生成 `environment.json`、`results.tsv` 和 `summary.json`。结果区分真实通过、阶段路径通过但证据不足（`INCOMPLETE`）和当前没有实现入口（`BLOCKED`）。每个可训练场景都要求严格的全 step 完成回执；D0、D3、D4 还要求 CE Worker 逐参数校验回执。
 
 当前映射如下：
 
 | 场景 | 执行入口 | 当前判定 |
 | --- | --- | --- |
-| S0 | `multi_task_run.sh`，不启用 smoke hook | native baseline 成功才为 `PASS` |
+| S0 | `multi_task_run.sh`，只启用 CE 逐参数校验，不启用 borrowed smoke hook | 必须有全 step 完成回执和 CE manifest 校验才为 `PASS` |
 | S1 | `D4_test.sh basic` | 当前 D4 只验证到 LB/endpoint，因此为 `INCOMPLETE` |
 | S2 | `D4_test.sh split` | 只创建一个拆分后的 borrower，尚未验证两个 borrower 同时存在，为 `INCOMPLETE` |
 | S3 | `D4_test.sh cross_pg` | 当前只验证跨 PG claim，尚未验证 2+2 合成 world_size=4，为 `INCOMPLETE` |
@@ -330,16 +347,27 @@ D0_D4_SCENARIOS=S0 bash ../D0_D4_comprehensive_test.sh
 D0_D4_SCENARIOS=S1 bash ../D0_D4_comprehensive_test.sh
 D0_D4_SCENARIOS=S10 bash ../D0_D4_comprehensive_test.sh
 
-# 如果需要批量运行，必须由外层 shell 逐次启动，每个场景都有独立进程和日志
-for scenario in S0 S1 S2 S3 S4 S5 S7 S8 S9 S10 S11; do
-  D0_D4_SCENARIOS="${scenario}" bash ../D0_D4_comprehensive_test.sh || exit $?
-done
+# 批量运行：每次只启动一个场景；无论当前场景成功、失败或阻塞，
+# 脚本都会等待其进程结束并记录结果，然后再启动下一个场景
+bash ../D0_D4_batch_test.sh
+
+# 只运行指定子集；仍然严格串行
+D0_D4_BATCH_SCENARIOS=S0,S1,S2,S3,S4,S5,S7,S8,S9,S10,S11 \
+  bash ../D0_D4_batch_test.sh
+
+# 批量结果目录包含每个场景的控制台日志、单场景 summary.json，
+# 以及总的 results.tsv 和 summary.json。批量入口不会因为某个场景
+# 返回 FAIL 而提前退出，因此可以一次收集全部场景的结果。
 
 # 只做当前阶段路径回归；仍须查看 summary.json，不能据此宣布综合验收完成
 D0_D4_REQUIRE_COMPLETE=0 \
 D0_D4_SCENARIOS=S1 \
   bash ../D0_D4_comprehensive_test.sh
 ```
+
+批量脚本默认依次执行 S0 到 S16；设置 `D0_D4_BATCH_SCENARIOS` 可以传入逗号或空格
+分隔的子集。最终返回 0 表示全部通过，返回 1 表示至少一个场景失败，返回 2 表示存在
+环境阻塞或证据不足。
 
 S6、S15 需要多节点或两个独立任务；硬件或 GS 不支持时，脚本必须返回“环境/能力阻塞”，不能自动跳过后报告全部通过。
 

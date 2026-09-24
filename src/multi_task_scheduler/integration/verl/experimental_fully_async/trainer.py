@@ -33,10 +33,62 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.parameter_snapshot_gate = asyncio.Lock()
+        self.parameter_validation_enabled = self._read_parameter_validation_enabled(self.config)
+        self._training_completion = None
         self._d3_bootstrap_rank = None
         self._d3_cleanup_after_test = True
         self._d3_bootstrap_result = None
         self._d3_suspended_donor_ranks = []
+
+    @staticmethod
+    def _read_parameter_validation_enabled(config) -> bool:
+        """Read the opt-in, test-only CE per-parameter verification switch."""
+        config_get = getattr(config, "get", None)
+        multitask = config_get("multitask", {}) if callable(config_get) else getattr(config, "multitask", {})
+        validation = multitask.get("parameter_validation", {}) if multitask is not None else {}
+        enabled = validation.get("enabled", False) if hasattr(validation, "get") else False
+        return bool(enabled)
+
+    def get_training_completion(self) -> dict:
+        """Return the only authoritative training-completion evidence.
+
+        ``FullyAsyncTaskRunner`` waits for both rollouter and trainer actors,
+        but its generic component messages do not identify whether all planned
+        training steps were processed.  The progress bar is advanced by the
+        native trainer exactly once per completed training step, so this
+        projection compares that count with the rollouter-derived target.
+        """
+        target_steps = self.total_train_steps
+        progress = getattr(self, "progress_bar", None)
+        completed_steps = int(getattr(progress, "n", 0)) if progress is not None else 0
+        target = int(target_steps) if target_steps is not None else None
+        completed = target is not None and completed_steps == target
+        return {
+            "state": "COMPLETED" if completed else "INCOMPLETE",
+            "completed": bool(completed),
+            "completed_steps": completed_steps,
+            "target_steps": target,
+            "global_steps": int(getattr(self, "global_steps", 0)),
+            "current_param_version": int(getattr(self, "current_param_version", 0)),
+        }
+
+    async def fit(self):
+        """Run native training and emit a strict completion receipt."""
+        try:
+            result = await super().fit()
+        except Exception as exc:
+            self._training_completion = self.get_training_completion()
+            self._training_completion.update({"state": "FAILED", "error": str(exc)})
+            raise
+        self._training_completion = self.get_training_completion()
+        print(
+            "MULTITASK_TRAINING_COMPLETE "
+            f"{json.dumps(self._training_completion, sort_keys=True, default=str)}",
+            flush=True,
+        )
+        if not self._training_completion["completed"]:
+            raise RuntimeError(f"training returned before all planned steps completed: {self._training_completion}")
+        return result
 
     async def _setup_checkpoint_manager(self):
         """Preserve native trainer.py:217-224; replace only the Manager class."""
@@ -45,6 +97,7 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
         self.checkpoint_manager = MultiTaskCheckpointEngineManager(
             config=checkpoint_engine_config, actor_wg=self.actor_wg, replicas=replicas
         )
+        self.checkpoint_manager.parameter_validation_enabled = self.parameter_validation_enabled
         print(f"[FullyAsyncTrainer] Checkpoint manager initialized (backend={checkpoint_engine_config.backend})")
 
     async def register_replica(self, replica_rank: int) -> dict:

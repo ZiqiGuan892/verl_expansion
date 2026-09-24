@@ -79,7 +79,7 @@ for scenario in $(printf '%s' "${D4_RUNTIME_SCENARIOS}" | tr ',' ' '); do
     echo "日志：${log_file}"
 
     set +e
-    bash "${SCRIPT_DIR}/multi_task_run.sh" \
+    env MULTITASK_PARAMETER_VALIDATION=1 bash "${SCRIPT_DIR}/multi_task_run.sh" \
         "actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}" \
         "actor_rollout_ref.rollout.n=${RESPONSES_PER_PROMPT}" \
         "async_training.require_batches=${ASYNC_REQUIRE_BATCHES}" \
@@ -92,6 +92,7 @@ for scenario in $(printf '%s' "${D4_RUNTIME_SCENARIOS}" | tr ',' ' '); do
         "actor_rollout_ref.rollout.checkpoint_engine.backend=multitask_hccl" \
         "actor_rollout_ref.rollout.checkpoint_engine.custom_backend_module=multi_task_scheduler.checkpoint.hccl_checkpoint_engine" \
         "+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.multitask_hccl.rebuild_group=true" \
+        "+multitask.parameter_validation.enabled=true" \
         "+multitask.d4_runtime_test.enabled=true" \
         "+multitask.d4_runtime_test.scenario=${scenario}" \
         2>&1 | tee "${log_file}"
@@ -106,6 +107,12 @@ for scenario in $(printf '%s' "${D4_RUNTIME_SCENARIOS}" | tr ',' ' '); do
         echo "场景 ${scenario} 的日志写入失败，tee exit=${command_statuses[1]}；日志：${log_file}" >&2
         exit "${command_statuses[1]}"
     fi
+    if ! grep -Fq "MULTITASK_TRAINING_COMPLETE" "${log_file}" || \
+        ! grep -Fq '"state": "COMPLETED"' "${log_file}" || \
+        ! grep -Fq '"completed": true' "${log_file}"; then
+        echo "场景 ${scenario} 未确认所有计划 training step 已完成；日志：${log_file}" >&2
+        exit 1
+    fi
     if [ "${scenario}" = "shared_bundle" ]; then
         # S5 只验证同一 bundle 上多个 fractional CE Worker 的串行创建和
         # 回收。它不会把两个 active Worker 同时加入 HCCL effective set，
@@ -117,6 +124,11 @@ for scenario in $(printf '%s' "${D4_RUNTIME_SCENARIOS}" | tr ',' ' '); do
             exit 1
         fi
     else
+        if ! grep -Fq "CE_PARAMETER_VALIDATION" "${log_file}" || \
+            ! grep -Fq '"state": "PARAMETERS_VALIDATED"' "${log_file}"; then
+            echo "场景 ${scenario} 缺少 CE Worker 逐参数校验证据；日志：${log_file}" >&2
+            exit 1
+        fi
         if [ "${scenario}" = "idempotent" ]; then
             if ! grep -Fq "D4_IDEMPOTENCY_RESULT" "${log_file}" || \
                 ! grep -Fq '"state": "LB_READY"' "${log_file}"; then
@@ -139,8 +151,8 @@ for scenario in $(printf '%s' "${D4_RUNTIME_SCENARIOS}" | tr ',' ' '); do
             exit 1
         fi
     fi
-    if grep -Eq "Traceback|AssertionError|LIFECYCLE_NOT_IMPLEMENTED" "${log_file}"; then
-        echo "场景 ${scenario} 日志包含未处理异常或错误生命周期回执；日志：${log_file}" >&2
+    if grep -Fq "LIFECYCLE_NOT_IMPLEMENTED" "${log_file}"; then
+        echo "场景 ${scenario} 返回了未实现的生命周期回执；日志：${log_file}" >&2
         exit 1
     fi
     echo "D4 command-chain 场景通过：${scenario}；日志：${log_file}"

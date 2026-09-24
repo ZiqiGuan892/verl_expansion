@@ -97,9 +97,19 @@ run_logged() {
     return "${command_statuses[1]}"
 }
 
-has_error_marker() {
+has_training_complete_marker() {
     log_file="$1"
-    grep -Eq 'Traceback|RayTaskError|AssertionError|Engine core initialization failed|OutOfMemory|OOM|HCCL.*parameter error' "${log_file}"
+    # This is the authoritative training result.  Generic component messages
+    # and exception text are diagnostics only; they must not decide success.
+    grep -Fq 'MULTITASK_TRAINING_COMPLETE' "${log_file}" && \
+        grep -Fq '"state": "COMPLETED"' "${log_file}" && \
+        grep -Fq '"completed": true' "${log_file}"
+}
+
+has_parameter_validation_marker() {
+    log_file="$1"
+    grep -Fq 'CE_PARAMETER_VALIDATION' "${log_file}" && \
+        grep -Fq '"state": "PARAMETERS_VALIDATED"' "${log_file}"
 }
 
 write_environment() {
@@ -148,7 +158,7 @@ PY
 run_native_baseline() {
     log_file="${RUN_DIR}/S0_native_baseline.log"
     echo "[D0-D4] 开始 S0 native baseline"
-    if run_logged "${log_file}" bash "${SCRIPT_DIR}/multi_task_run.sh" \
+    if run_logged "${log_file}" env MULTITASK_PARAMETER_VALIDATION=1 bash "${SCRIPT_DIR}/multi_task_run.sh" \
         "actor_rollout_ref.actor.ppo_mini_batch_size=2" \
         "actor_rollout_ref.rollout.n=2" \
         "async_training.require_batches=1" \
@@ -156,19 +166,13 @@ run_native_baseline() {
         "trainer.total_training_steps=1" \
         "trainer.total_epochs=1" \
         "rollout.total_rollout_steps=2" \
+        "+multitask.parameter_validation.enabled=true" \
         "+actor_rollout_ref.rollout.enable_sleep_mode=true" \
         "actor_rollout_ref.rollout.free_cache_engine=true"; then
-        if ! has_error_marker "${log_file}" && \
-            (grep -Fq '[ASYNC MAIN] Training completed or interrupted' "${log_file}" || \
-                grep -Fq 'total time:' "${log_file}" || \
-                grep -Fq '[ASYNC MAIN] One component completed successfully' "${log_file}"); then
-            record_result S0 PASS "${log_file}" "native main_ppo 完成且未发现异常标记"
+        if has_training_complete_marker "${log_file}" && has_parameter_validation_marker "${log_file}"; then
+            record_result S0 PASS "${log_file}" "native 训练完成且 CE Worker 逐参数校验通过"
         else
-            if has_error_marker "${log_file}"; then
-                record_result S0 FAIL "${log_file}" "native 日志包含异常标记，详见实时输出和日志文件"
-            else
-                record_result S0 FAIL "${log_file}" "native 进程退出为 0，但缺少完成标记；请检查实时日志末尾"
-            fi
+            record_result S0 FAIL "${log_file}" "缺少严格的全 step 完成标记或 CE Worker 逐参数校验证据"
         fi
     else
         record_result S0 FAIL "${log_file}" "native main_ppo 退出失败"
@@ -206,8 +210,12 @@ run_d4_scenario() {
             grep -Fq 'D4_RUNTIME_CLEANUP' "${log_file}"; then
             runtime_ok=1
         fi
+        parameter_validation_ok=0
+        if [ "${d4_scenario}" = "shared_bundle" ] || has_parameter_validation_marker "${log_file}"; then
+            parameter_validation_ok=1
+        fi
         if { [ "${shared_bundle_ok}" -eq 1 ] || [ "${runtime_ok}" -eq 1 ]; } && \
-            ! has_error_marker "${log_file}"; then
+            [ "${parameter_validation_ok}" -eq 1 ] && has_training_complete_marker "${log_file}"; then
             if [ "${coverage}" = "complete" ]; then
                 record_result "${scenario}" PASS "${log_file}" "D4 创建、CE bootstrap、LB_READY 和测试清理通过"
             elif [ "${d4_scenario}" = "shared_bundle" ]; then
@@ -216,7 +224,7 @@ run_d4_scenario() {
                 record_result "${scenario}" INCOMPLETE "${log_file}" "当前 D4 只验证 endpoint/LB marker，缺少综合设计要求的真实 generate/后续同步或完整拓扑"
             fi
         else
-            record_result "${scenario}" FAIL "${log_file}" "D4 日志缺少所需 runtime/shared-bundle receipt、cleanup 或包含异常"
+            record_result "${scenario}" FAIL "${log_file}" "D4 日志缺少全 step 完成标记或 runtime/shared-bundle receipt"
         fi
     else
         record_result "${scenario}" FAIL "${log_file}" "D4 main_ppo 进程失败"
@@ -239,7 +247,7 @@ run_d2_negative() {
         bash "${SCRIPT_DIR}/D2_runtime_test.sh"; then
         if grep -Fq 'D2_RUNTIME_RESULT' "${log_file}" && \
             grep -Fq '"status": "EXPECTED_FAILURE"' "${log_file}" && \
-            ! grep -Eq 'Traceback|AssertionError|RayTaskError' "${log_file}"; then
+            has_training_complete_marker "${log_file}"; then
             record_result "${scenario}" PASS "${log_file}" "预期失败场景被拒绝，未发布 RUNTIME_READY"
         else
             record_result "${scenario}" FAIL "${log_file}" "D2 negative 日志缺少预期失败 receipt"

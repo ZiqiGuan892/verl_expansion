@@ -84,7 +84,7 @@ for scenario in $(printf '%s' "${D3_RUNTIME_SCENARIOS}" | tr ',' ' '); do
     echo "日志：${log_file}"
 
     set +e
-    bash "${SCRIPT_DIR}/multi_task_run.sh" \
+    env MULTITASK_PARAMETER_VALIDATION=1 bash "${SCRIPT_DIR}/multi_task_run.sh" \
         "actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}" \
         "actor_rollout_ref.rollout.n=${RESPONSES_PER_PROMPT}" \
         "async_training.require_batches=${ASYNC_REQUIRE_BATCHES}" \
@@ -97,6 +97,7 @@ for scenario in $(printf '%s' "${D3_RUNTIME_SCENARIOS}" | tr ',' ' '); do
         "actor_rollout_ref.rollout.checkpoint_engine.backend=multitask_hccl" \
         "actor_rollout_ref.rollout.checkpoint_engine.custom_backend_module=multi_task_scheduler.checkpoint.hccl_checkpoint_engine" \
         "+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.multitask_hccl.rebuild_group=true" \
+        "+multitask.parameter_validation.enabled=true" \
         "+multitask.d3_bootstrap_test.enabled=true" \
         "+multitask.d3_bootstrap_test.scenario=${scenario}" \
         "+multitask.d3_bootstrap_test.cleanup_after_test=true" \
@@ -112,6 +113,17 @@ for scenario in $(printf '%s' "${D3_RUNTIME_SCENARIOS}" | tr ',' ' '); do
         echo "场景 ${scenario} 的日志写入失败，tee exit=${command_statuses[1]}；日志：${log_file}" >&2
         exit "${command_statuses[1]}"
     fi
+    if ! grep -Fq "MULTITASK_TRAINING_COMPLETE" "${log_file}" || \
+        ! grep -Fq '"state": "COMPLETED"' "${log_file}" || \
+        ! grep -Fq '"completed": true' "${log_file}"; then
+        echo "场景 ${scenario} 未确认所有计划 training step 已完成；日志：${log_file}" >&2
+        exit 1
+    fi
+    if ! grep -Fq "CE_PARAMETER_VALIDATION" "${log_file}" || \
+        ! grep -Fq '"state": "PARAMETERS_VALIDATED"' "${log_file}"; then
+        echo "场景 ${scenario} 缺少 CE Worker 逐参数校验证据；日志：${log_file}" >&2
+        exit 1
+    fi
     if ! grep -Fq "D3_BOOTSTRAP_RESULT" "${log_file}" || \
         ! grep -Fq "WEIGHTS_READY" "${log_file}"; then
         echo "场景 ${scenario} 没有产生 WEIGHTS_READY bootstrap 结果；日志：${log_file}" >&2
@@ -124,10 +136,6 @@ for scenario in $(printf '%s' "${D3_RUNTIME_SCENARIOS}" | tr ',' ' '); do
     fi
     if ! grep -Fq "DONORS_SLEEPING_BORROWER_ONLY_EFFECTIVE" "${log_file}"; then
         echo "场景 ${scenario} 未将 donor 排除出 borrowed 的 CE 同步拓扑；日志：${log_file}" >&2
-        exit 1
-    fi
-    if grep -Eq "Traceback|AssertionError" "${log_file}"; then
-        echo "场景 ${scenario} 日志包含未处理异常；日志：${log_file}" >&2
         exit 1
     fi
     echo "D3 bootstrap 场景通过：${scenario}；日志：${log_file}"

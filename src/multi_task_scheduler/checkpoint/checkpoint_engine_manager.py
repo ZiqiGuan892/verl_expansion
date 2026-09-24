@@ -1,6 +1,8 @@
 """Checkpoint manager extensions for borrowed-replica membership and bootstrap."""
 
 import asyncio
+import hashlib
+import json
 
 import ray
 
@@ -28,6 +30,10 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         self.inflight_replicas = []
         self.last_synced_versions: dict[int, int] = {}
         self.pending_bootstrap: dict[int, int | None] = {}
+        # Full per-parameter receiver verification is intentionally opt-in:
+        # hashing every model tensor adds measurable transfer-time overhead.
+        # D3/D4 acceptance scripts enable it when they need strict evidence.
+        self.parameter_validation_enabled = False
         # Replica ranks temporarily excluded from the effective CE set while
         # their physical slots are leased to a borrowed replica.  The donor
         # server is slept by the rollout manager; this set prevents its CE
@@ -171,6 +177,14 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             try:
                 result = await super().update_weights(global_steps=global_steps)
                 version = int(global_steps) if global_steps is not None else None
+                if self.parameter_validation_enabled:
+                    validation = await self.validate_parameter_sync(
+                        replicas=self.inflight_replicas,
+                        expected_version=version,
+                    )
+                    if isinstance(result, dict):
+                        result["parameter_validation"] = validation
+                    print(f"CE_PARAMETER_VALIDATION {json.dumps(validation, sort_keys=True, default=str)}")
                 if version is not None:
                     for replica in self.inflight_replicas:
                         rank = self._replica_rank(replica)
@@ -242,17 +256,26 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
                 kv_resumed = True
                 await registered.resume_generation()
                 generation_resumed = True
+                if self.parameter_validation_enabled:
+                    validation = await self.validate_parameter_sync(
+                        replicas=[registered],
+                        expected_version=snapshot_version,
+                    )
+                    print(f"CE_PARAMETER_VALIDATION {json.dumps(validation, sort_keys=True, default=str)}")
                 self.last_synced_versions[rank] = snapshot_version
                 self.pending_bootstrap.pop(rank, None)
                 registered.serving_version = snapshot_version
                 self.sync_state = "IDLE"
-                return {
+                result = {
                     "replica_rank": rank,
                     "state": "WEIGHTS_READY",
                     "version": snapshot_version,
                     "communication": "target_only",
                     "finalized": True,
                 }
+                if self.parameter_validation_enabled:
+                    result["parameter_validation"] = validation
+                return result
             except Exception:
                 self.sync_state = "BLOCKED"
                 # Keep pending_bootstrap so the failed replica cannot enter the
@@ -282,3 +305,56 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
                         pass
                 if self.sync_state == "IDLE":
                     self.inflight_replicas = []
+
+    @staticmethod
+    def _manifest_digest(manifest: dict) -> str:
+        entries = manifest.get("parameters", [])
+        canonical = [
+            {
+                "name": item.get("name"),
+                "shape": list(item.get("shape", [])),
+                "dtype": item.get("dtype"),
+                "numel": int(item.get("numel", 0)),
+                "sha256": item.get("sha256"),
+            }
+            for item in entries
+        ]
+        canonical.sort(key=lambda item: item["name"] or "")
+        encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    async def validate_parameter_sync(self, replicas, expected_version: int | None = None) -> dict:
+        """Verify every received parameter on every CE Worker.
+
+        The receiver worker records a SHA-256 fingerprint while streaming each
+        named tensor into ``ServerAdapter``.  This method compares the complete
+        name/shape/dtype/value manifest across all workers and checks the
+        frozen sync version.  It returns metadata only; tensor payloads never
+        leave the CE Worker process.
+        """
+        workers = [worker for replica in replicas for worker in getattr(replica, "workers", [])]
+        if not workers:
+            raise RuntimeError("parameter validation requires at least one CE Worker")
+        manifests = ray.get([worker.get_parameter_manifest.remote() for worker in workers])
+        if not manifests or any(not manifest.get("complete", False) for manifest in manifests):
+            raise RuntimeError(f"CE parameter manifest is incomplete: {manifests}")
+        if expected_version is not None:
+            mismatched_versions = [
+                manifest.get("global_steps") for manifest in manifests if manifest.get("global_steps") != expected_version
+            ]
+            if mismatched_versions:
+                raise RuntimeError(
+                    f"CE parameter version mismatch: expected={expected_version}, received={mismatched_versions}"
+                )
+        digests = [self._manifest_digest(manifest) for manifest in manifests]
+        if len(set(digests)) != 1:
+            raise RuntimeError(f"CE workers received different parameter manifests: {digests}")
+        first = manifests[0]
+        return {
+            "state": "PARAMETERS_VALIDATED",
+            "version": first.get("global_steps"),
+            "worker_count": len(manifests),
+            "parameter_count": first.get("parameter_count", 0),
+            "total_numel": first.get("total_numel", 0),
+            "manifest_digest": digests[0],
+        }

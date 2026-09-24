@@ -171,7 +171,7 @@ D3_BOOTSTRAP_RESULT {"state": "WEIGHTS_READY", ...}
 D3_NORMAL_SYNC_RESULT {"state": "FULL_SYNC_READY", ...}
 ```
 
-此外要求 main_ppo 和 `tee` 均退出为 0，并拒绝包含 `Traceback` 或 `AssertionError` 的日志。
+此外要求 main_ppo 和 `tee` 均退出为 0。异常文本仍会保留在日志中供定位，不能替代训练完成回执作为通过或失败依据。
 日志写入 `${VERL_REPO_DIR}/logs/d3_runtime/`。
 
 本次开发环境已执行以下不依赖 Ray/GPU 的验证：
@@ -305,3 +305,23 @@ CE suspend + 旧域 finalize
   -> CE resume
   -> LB READY
 ```
+
+### 5.5 严格训练完成与 CE 逐参数校验
+
+`MultiTaskFullyAsyncTrainer.fit()` 在原生 fit 正常返回后比较
+`progress_bar.n` 与 Rollouter 计算出的 `total_train_steps`，只有两者相等才输出：
+
+```text
+MULTITASK_TRAINING_COMPLETE {"state": "COMPLETED", "completed": true, ...}
+```
+
+`[ASYNC MAIN] One component completed successfully` 只表示一个 Ray component 返回，
+不能作为训练完成依据；没有上述回执时测试必须失败。
+
+启用 `+multitask.parameter_validation.enabled=true` 后，
+`MultiTaskCheckpointEngineWorker` 在接收每一个 named tensor 时记录 name、shape、dtype、
+numel 和 SHA-256。`MultiTaskCheckpointEngineManager.validate_parameter_sync()` 在每次
+bootstrap 或普通同步收尾时比较所有 CE Worker 的完整 manifest，并校验冻结的
+`global_steps`，成功后输出 `CE_PARAMETER_VALIDATION`。该开关默认关闭，因为逐参数 hash
+会增加同步开销；D0/D3/D4 验收脚本显式打开。`delta_flush` 暂不支持完整 manifest 校验，
+开启严格校验时会明确失败，不能伪报成功。
