@@ -92,6 +92,8 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
 
     async def cleanup_d3_runtime(self, replica_rank: int, global_steps: int | None = None) -> dict:
         """Release only the actors created by the D3 smoke scenario."""
+        # TODO(lifecycle): production reclaim/destroy must be coordinated by
+        # the lifecycle owner, not routed through this D3-only cleanup hook.
         return await self.llm_server_manager.cleanup_d3_runtime(replica_rank, global_steps=global_steps)
 
     async def mark_replica_serving_version(self, replica_rank: int, version: int) -> dict:

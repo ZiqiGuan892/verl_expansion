@@ -29,3 +29,6 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
         self._require_test_sleep_mode()
         await self.engine.wake_up(tags=["weights", "kv_cache"])
         await self.engine.reset_prefix_cache(reset_connector=True)
+        # TODO(lifecycle): production wake must target-sync the latest actor
+        # parameters before this server accepts traffic. Engine wake only
+        # restores the frozen sleep snapshot; it does not perform CE sync.

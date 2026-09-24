@@ -135,6 +135,9 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 # Donors were excluded from the CE topology while the
                 # borrowed worker occupied their physical slots.  Restore the
                 # serving tag explicitly before generation resumes.
+                # TODO(lifecycle): replace this metadata-only assignment with
+                # a target-only CE sync to the latest actor version. Setting
+                # global_steps cannot update stale model weights.
                 await self._test_memory_call(donor, "set_global_steps", int(global_steps))
         record["sleeping_donors"] = []
         self.rollout_replicas = [item for item in self.rollout_replicas if item is not replica]
@@ -747,6 +750,8 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
 
     async def reclaim_replica(self, lease_id: str) -> dict:
         """Reserve the reclaim contract without performing lifecycle cleanup."""
+        # TODO(lifecycle): replace this reserved receipt with the full reclaim
+        # transaction, including borrower drain, CE/LB removal and claim return.
         if not isinstance(lease_id, str) or not lease_id:
             raise ValueError("lease_id must be a non-empty string")
         async with self.replica_operation_lock:

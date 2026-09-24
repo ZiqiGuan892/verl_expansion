@@ -268,6 +268,9 @@ class MultiTaskvLLMReplica(vLLMReplica):
 
     async def _cleanup_runtime(self) -> dict:
         """Request termination of owned actors, never claim a lease is released."""
+        # TODO(lifecycle): replace this D3/test cleanup with the production
+        # destroy transaction: drain/abort requests, remove CE/LB membership,
+        # release communication groups, then destroy server and worker actors.
         result = {"kill_requested": [], "errors": [], "release_confirmed": False}
         for handle in list(self.servers) + list(self.workers):
             try:
@@ -342,6 +345,8 @@ class MultiTaskvLLMReplica(vLLMReplica):
 
     async def destroy(self) -> dict:
         """Reserved lifecycle entry; failed-creation cleanup is not destroy."""
+        # TODO(lifecycle): implement the production destroy state machine and
+        # confirm that all actor, engine and communication resources are gone.
         return self._lifecycle_receipt(
             "LIFECYCLE_NOT_IMPLEMENTED", "production destroy is deferred",
             lease_id=self.lease_id, state=self.runtime_state,
@@ -349,6 +354,8 @@ class MultiTaskvLLMReplica(vLLMReplica):
 
     async def reclaim(self, lease_id: str) -> dict:
         """Reserve reclaim and reject leases that do not own this runtime."""
+        # TODO(lifecycle): implement reclaim after drain/partial-rollout,
+        # CE removal/finalize, server shutdown and donor claim release.
         if self.allocation_kind != "borrowed":
             return self._lifecycle_receipt(
                 "INVALID_ALLOCATION_KIND", "native replica cannot be reclaimed by borrower lease",
