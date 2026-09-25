@@ -2,8 +2,8 @@
 #
 # D0-D4 综合验收入口。
 #
-# 该脚本把当前已经存在的 native、D2 runtime、D3 bootstrap 和 D4
-# command-chain 入口串起来，并为尚未实现生产故障注入的场景明确返回
+# 该脚本复用 native 入口和 D2 negative，D4 正例启用真实 E2E fixture，
+# 严格校验一次进程的完整结构化回执。尚缺环境/fixture 的场景明确返回
 # INCOMPLETE/BLOCKED。它不会把缺少实现的场景伪报为通过。
 #
 # 服务器上的典型用法：
@@ -182,7 +182,6 @@ run_native_baseline() {
 run_d4_scenario() {
     scenario="$1"
     d4_scenario="$2"
-    coverage="$3"
     log_file="${RUN_DIR}/${scenario}_d4.log"
     child_log_dir="${RUN_DIR}/${scenario}_d4_logs"
     mkdir -p "${child_log_dir}"
@@ -191,40 +190,16 @@ run_d4_scenario() {
         VERL_REPO_DIR="${VERL_REPO_DIR}" \
         VERL_SOURCE_ROOT="${VERL_SOURCE_ROOT}" \
         VERL_MULTI_TASK_ROOT="${VERL_MULTI_TASK_ROOT}" \
+        PYTHON_BIN="${PYTHON_BIN}" \
+        D4_E2E_TEST=1 \
         D4_RUNTIME_SCENARIOS="${d4_scenario}" \
         D4_RUNTIME_LOG_DIR="${child_log_dir}" \
         bash "${SCRIPT_DIR}/D4_test.sh"; then
-        shared_bundle_ok=0
-        if [ "${d4_scenario}" = "shared_bundle" ] && \
-            grep -Fq 'D4_SHARED_BUNDLE_RESULT' "${log_file}" && \
-            grep -Fq '"state": "PLACEMENT_READY"' "${log_file}" && \
-            grep -Fq 'D4_SHARED_BUNDLE_CLEANUP' "${log_file}"; then
-            shared_bundle_ok=1
-        fi
-        runtime_ok=0
-        if { \
-            { grep -Fq 'D4_RUNTIME_RESULT' "${log_file}"; } || \
-            { [ "${d4_scenario}" = "idempotent" ] && grep -Fq 'D4_IDEMPOTENCY_RESULT' "${log_file}"; } || \
-            { [ "${d4_scenario}" = "concurrent_idempotent" ] && grep -Fq 'D4_CONCURRENCY_RESULT' "${log_file}"; }; \
-        } && grep -Fq '"state": "LB_READY"' "${log_file}" && \
-            grep -Fq 'D4_RUNTIME_CLEANUP' "${log_file}"; then
-            runtime_ok=1
-        fi
-        parameter_validation_ok=0
-        if [ "${d4_scenario}" = "shared_bundle" ] || has_parameter_validation_marker "${log_file}"; then
-            parameter_validation_ok=1
-        fi
-        if { [ "${shared_bundle_ok}" -eq 1 ] || [ "${runtime_ok}" -eq 1 ]; } && \
-            [ "${parameter_validation_ok}" -eq 1 ] && has_training_complete_marker "${log_file}"; then
-            if [ "${coverage}" = "complete" ]; then
-                record_result "${scenario}" PASS "${log_file}" "D4 创建、CE bootstrap、LB_READY 和测试清理通过"
-            elif [ "${d4_scenario}" = "shared_bundle" ]; then
-                record_result "${scenario}" INCOMPLETE "${log_file}" "同 bundle fractional CE Worker 的串行 placement 和清理通过；HCCL/LB 同时接流被设计约束，尚缺真实生成与普通同步"
-            else
-                record_result "${scenario}" INCOMPLETE "${log_file}" "当前 D4 只验证 endpoint/LB marker，缺少综合设计要求的真实 generate/后续同步或完整拓扑"
-            fi
+        if "${PYTHON_BIN}" "${VERL_MULTI_TASK_ROOT}/src/multi_task_scheduler/testing/e2e_verdict.py" \
+            "${log_file}" "${d4_scenario}" --process-exit-code 0; then
+            record_result "${scenario}" PASS "${log_file}" "真实 E2E 回执通过：拓扑、逐 replica 生成、训练期普通同步、版本推进和测试清理"
         else
-            record_result "${scenario}" FAIL "${log_file}" "D4 日志缺少全 step 完成标记或 runtime/shared-bundle receipt"
+            record_result "${scenario}" FAIL "${log_file}" "D4 真实 E2E 结构化回执不完整或相互矛盾"
         fi
     else
         record_result "${scenario}" FAIL "${log_file}" "D4 main_ppo 进程失败"
@@ -292,17 +267,20 @@ esac
 scenario="${D0_D4_SCENARIOS}"
 case "${scenario}" in
     S0) run_native_baseline ;;
-    S1) run_d4_scenario S1 basic partial ;;
-    S2) run_d4_scenario S2 split partial ;;
-    S3) run_d4_scenario S3 cross_pg partial ;;
-    S4) run_d4_scenario S4 fragmented partial ;;
-    S5) run_d4_scenario S5 shared_bundle partial ;;
-    S7) run_d4_scenario S7 merge_world_size partial ;;
-    S8) run_d4_scenario S8 idempotent partial ;;
-    S9) run_d4_scenario S9 concurrent_idempotent partial ;;
+    S1) run_d4_scenario S1 basic ;;
+    S2) run_d4_scenario S2 split ;;
+    S3) run_d4_scenario S3 cross_pg ;;
+    S4) run_d4_scenario S4 fragmented ;;
+    S5) run_d4_scenario S5 shared_bundle ;;
+    S6) record_result S6 BLOCKED "" "跨节点真实拓扑需要多机环境和已配置的跨节点 fixture" ;;
+    S7) run_d4_scenario S7 merge_world_size ;;
+    S8) run_d4_scenario S8 idempotent ;;
+    S9) run_d4_scenario S9 concurrent_idempotent ;;
     S10) run_d2_negative S10 expired ;;
     S11) run_d2_negative S11 missing_pg,duplicate_device ;;
-    S12|S13|S14|S16) mark_blocked "${scenario}" ;;
+    S12|S13|S14) mark_blocked "${scenario}" ;;
+    S15) record_result S15 BLOCKED "" "跨 Task 隔离验收缺少独立 donor/borrower Task fixture" ;;
+    S16) run_d4_scenario S16 pressure ;;
     *) record_result "${scenario}" BLOCKED "" "未知综合验收场景" ;;
 esac
 

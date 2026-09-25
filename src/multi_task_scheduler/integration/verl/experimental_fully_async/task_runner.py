@@ -112,6 +112,19 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                 "error": None,
             }
 
+    def _run_training_loop(self):
+        """Opt-in acceptance retains borrowed runtimes across the native fit loop."""
+        from multi_task_scheduler.testing.e2e_runtime import enabled, run_training_fixture
+
+        config = self.components["config"]
+        if not enabled(config):
+            return super()._run_training_loop()
+        multitask = config.get("multitask", {})
+        if any(multitask.get(name, {}).get("enabled", False) for name in
+               ("d2_runtime_test", "d3_bootstrap_test", "d4_runtime_test")):
+            raise ValueError("E2E must run alone, without the legacy D2/D3/D4 smoke fixtures")
+        return run_training_fixture(self, super()._run_training_loop)
+
     def _maybe_run_d4_runtime_smoke(self, config) -> None:
         """Run the opt-in post-training D4 command-chain smoke.
 

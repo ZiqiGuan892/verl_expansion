@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 #
-# D4 真实 main_ppo 端到端入口：
+# D4 真实 main_ppo 入口（默认 command-chain smoke）：
 # native training -> TaskRunner create command -> borrowed runtime -> CE
 # target-only bootstrap -> LB READY -> endpoint probe -> test cleanup。
 #
 # D4 的生产 sleep/wake、drain、commit_remove、reclaim 和 destroy 仍未实现；
-# 本脚本只验证 D4 创建调用链和 READY 发布边界。
+# 默认验证 D4 创建调用链和 READY 发布边界。D4_E2E_TEST=1 另启用
+# 训练前创建、真实生成、训练期普通同步和训练后恢复/清理的测试 fixture。
 set -eu
 set -x
 
@@ -21,11 +22,31 @@ export VERL_MULTI_TASK_ROOT="${VERL_MULTI_TASK_ROOT:-${VERL_SOURCE_ROOT}/multi_t
 
 D4_RUNTIME_SCENARIOS="${D4_RUNTIME_SCENARIOS:-basic}"
 D4_RUNTIME_LOG_DIR="${D4_RUNTIME_LOG_DIR:-${VERL_REPO_DIR}/logs/d4_runtime}"
+D4_E2E_TEST="${D4_E2E_TEST:-0}"
+case "${D4_E2E_TEST}" in
+    0|1) ;;
+    *) echo "D4_E2E_TEST 必须为 0 或 1。" >&2; exit 1 ;;
+esac
+if [ "${D4_E2E_TEST}" = "1" ]; then
+    PYTHON_BIN="${PYTHON_BIN:-python3}"
+    E2E_VERDICT="${VERL_MULTI_TASK_ROOT}/src/multi_task_scheduler/testing/e2e_verdict.py"
+    if [ ! -f "${E2E_VERDICT}" ] && [ -f "${SCRIPT_DIR}/src/multi_task_scheduler/testing/e2e_verdict.py" ]; then
+        E2E_VERDICT="${SCRIPT_DIR}/src/multi_task_scheduler/testing/e2e_verdict.py"
+    fi
+    [ -f "${E2E_VERDICT}" ] && command -v "${PYTHON_BIN}" >/dev/null 2>&1 || {
+        echo "E2E 缺少 Python 或回执校验器：${PYTHON_BIN} / ${E2E_VERDICT}" >&2
+        exit 1
+    }
+fi
 mkdir -p "${D4_RUNTIME_LOG_DIR}"
 
 # 保持与 D3 的最小合法训练规模一致：4 张训练 NPU 需要 4 条序列。
 export TRAIN_TOTAL_EPOCHS="${D4_TRAIN_TOTAL_EPOCHS:-1}"
-export TOTAL_TRAINING_STEPS="${D4_TOTAL_TRAINING_STEPS:-1}"
+D4_DEFAULT_TRAINING_STEPS=1
+if [ "${D4_E2E_TEST}" = "1" ]; then
+    D4_DEFAULT_TRAINING_STEPS=2
+fi
+export TOTAL_TRAINING_STEPS="${D4_TOTAL_TRAINING_STEPS:-${D4_DEFAULT_TRAINING_STEPS}}"
 export RESPONSES_PER_PROMPT="${D4_RESPONSES_PER_PROMPT:-2}"
 export RESPONSES_PER_PROMPT_VAL="${D4_RESPONSES_PER_PROMPT_VAL:-1}"
 export PPO_MINI_BATCH_SIZE="${D4_PPO_MINI_BATCH_SIZE:-2}"
@@ -51,6 +72,10 @@ if ! [ "${TOTAL_ROLLOUT_STEPS}" -ge "${D4_REQUIRED_PROMPTS}" ] 2>/dev/null; then
 fi
 
 case "${D4_RUNTIME_SCENARIOS}" in
+    ,*|*,|*,,*)
+        echo "D4_RUNTIME_SCENARIOS 不能包含空场景。" >&2
+        exit 1
+        ;;
     *[!a-zA-Z0-9_,]*)
         echo "D4_RUNTIME_SCENARIOS 只允许使用字母、数字、下划线和逗号。" >&2
         exit 1
@@ -62,8 +87,14 @@ for scenario in $(printf '%s' "${D4_RUNTIME_SCENARIOS}" | tr ',' ' '); do
     case "${scenario}" in
         basic|split|fragmented|cross_pg|shared_bundle|merge_world_size|idempotent|concurrent_idempotent)
             ;;
+        pressure)
+            if [ "${D4_E2E_TEST}" != "1" ]; then
+                echo "pressure 场景需要 D4_E2E_TEST=1。" >&2
+                exit 1
+            fi
+            ;;
         *)
-            echo "D4 不支持场景：${scenario}；可选 basic、split、fragmented、cross_pg、shared_bundle、merge_world_size、idempotent、concurrent_idempotent。" >&2
+            echo "D4 不支持场景：${scenario}；可选 basic、split、fragmented、cross_pg、shared_bundle、merge_world_size、idempotent、concurrent_idempotent，以及 E2E 专用 pressure。" >&2
             exit 1
             ;;
     esac
@@ -75,7 +106,13 @@ for scenario in $(printf '%s' "${D4_RUNTIME_SCENARIOS}" | tr ',' ' '); do
     fi
 
     log_file="${D4_RUNTIME_LOG_DIR}/d4_${scenario}_$(date +%Y%m%d%H%M%S).log"
-    echo "开始 D4 command-chain 场景：${scenario}"
+    if [ "${D4_E2E_TEST}" = "1" ]; then
+        test_overrides=( "+multitask.d4_runtime_test.enabled=false" "+multitask.e2e_test.enabled=true" "+multitask.e2e_test.scenario=${scenario}" )
+        echo "开始 D4 真实 E2E 场景：${scenario}"
+    else
+        test_overrides=( "+multitask.d4_runtime_test.enabled=true" "+multitask.d4_runtime_test.scenario=${scenario}" )
+        echo "开始 D4 command-chain smoke 场景：${scenario}"
+    fi
     echo "日志：${log_file}"
 
     set +e
@@ -94,8 +131,7 @@ for scenario in $(printf '%s' "${D4_RUNTIME_SCENARIOS}" | tr ',' ' '); do
         "+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.multitask_hccl.rebuild_group=true" \
         "+multitask.parameter_validation.enabled=true" \
         "+multitask.source_validation.enabled=true" \
-        "+multitask.d4_runtime_test.enabled=true" \
-        "+multitask.d4_runtime_test.scenario=${scenario}" \
+        "${test_overrides[@]}" \
         2>&1 | tee "${log_file}"
     command_statuses=( "${PIPESTATUS[@]}" )
     set -e
@@ -107,6 +143,17 @@ for scenario in $(printf '%s' "${D4_RUNTIME_SCENARIOS}" | tr ',' ' '); do
     if [ "${command_statuses[1]}" -ne 0 ]; then
         echo "场景 ${scenario} 的日志写入失败，tee exit=${command_statuses[1]}；日志：${log_file}" >&2
         exit "${command_statuses[1]}"
+    fi
+    if [ "${D4_E2E_TEST}" = "1" ]; then
+        # One structured receipt binds training, real generation, normal CE
+        # synchronization and cleanup. Do not combine unrelated grep markers.
+        if ! "${PYTHON_BIN}" "${E2E_VERDICT}" "${log_file}" "${scenario}" \
+            --process-exit-code "${command_statuses[0]}"; then
+            echo "场景 ${scenario} 的真实 E2E 回执校验失败；日志：${log_file}" >&2
+            exit 1
+        fi
+        echo "D4 真实 E2E 场景通过：${scenario}；日志：${log_file}"
+        continue
     fi
     if ! grep -Fq "MULTITASK_TRAINING_COMPLETE" "${log_file}" || \
         ! grep -Fq '"state": "COMPLETED"' "${log_file}" || \
@@ -163,5 +210,9 @@ for scenario in $(printf '%s' "${D4_RUNTIME_SCENARIOS}" | tr ',' ' '); do
     echo "D4 command-chain 场景通过：${scenario}；日志：${log_file}"
 done
 
-echo "D4 TaskRunner -> runtime -> CE bootstrap -> LB READY 场景全部通过。"
+if [ "${D4_E2E_TEST}" = "1" ]; then
+    echo "D4 真实生成、训练期普通同步、版本推进和测试清理回执全部通过。"
+else
+    echo "D4 TaskRunner -> runtime -> CE bootstrap -> LB READY smoke 场景全部通过。"
+fi
 echo "D4 不实现生产 sleep/wake、drain、commit_remove、reclaim/destroy。"

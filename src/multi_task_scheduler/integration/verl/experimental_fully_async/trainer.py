@@ -233,6 +233,10 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
         """Serialize normal sync with target bootstrap and verify one full sync."""
         async with self.parameter_snapshot_gate:
             result = await super()._fit_update_weights()
+            if result is not None and getattr(self, "_e2e_syncs", None) is not None:
+                from multi_task_scheduler.testing.e2e_runtime import record_normal_sync
+
+                await record_normal_sync(self)
         if result is not None and self._d3_bootstrap_rank is not None:
             rank = self._d3_bootstrap_rank
             version = self.checkpoint_manager.last_synced_versions.get(rank)
@@ -257,3 +261,11 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
                 self._d3_suspended_donor_ranks = []
             self._d3_bootstrap_rank = None
         return result
+
+    async def e2e_test_action(self, action: str, payload: dict) -> dict:
+        """Test-only CE observations and quiet-window restoration."""
+        from multi_task_scheduler.testing.e2e_runtime import dispatch_trainer, enabled
+
+        if not enabled(self.config):
+            raise RuntimeError("real E2E fixture is not enabled for this job")
+        return await dispatch_trainer(self, action, payload)

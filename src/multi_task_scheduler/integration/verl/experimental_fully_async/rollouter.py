@@ -118,6 +118,14 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
         """Return the test-only idempotency projection without exposing handles."""
         return await self.llm_server_manager.test_operation_snapshot(lease_id)
 
+    async def e2e_test_action(self, action: str, payload: dict) -> dict:
+        """Explicitly enabled test fixture; normal GS commands never use it."""
+        from multi_task_scheduler.testing.e2e_runtime import dispatch_rollout, enabled
+
+        if not enabled(self.config):
+            raise RuntimeError("real E2E fixture is not enabled for this job")
+        return await dispatch_rollout(self, action, payload)
+
     async def run_d4_shared_bundle_smoke(self) -> dict:
         """Run the opt-in same-bundle placement fixture owned by the manager."""
         return await self.llm_server_manager.run_d4_shared_bundle_smoke()

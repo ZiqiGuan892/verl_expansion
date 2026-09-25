@@ -236,13 +236,20 @@ def test_rollouter_passes_gs_and_preserves_native_agent_loop_arguments():
 def test_trainer_uses_rollouter_replica_projection_for_native_checkpoint_manager():
     checkpoint_config = SimpleNamespace(backend="nccl")
     converter = Mock(return_value=checkpoint_config)
-    factory = Mock(return_value=object())
+    factory = Mock(return_value=SimpleNamespace())
+    config = SimpleNamespace(actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(checkpoint_engine=object())))
+
+    class Parent:
+        def __init__(self):
+            # The real parent establishes config before plugin __init__ reads
+            # its opt-in validation flags. Keep this boundary faithful.
+            self.config = config
+
     trainer_class = _isolated_class(
-        f"{INTEGRATION}/trainer.py", "MultiTaskFullyAsyncTrainer", object,
+        f"{INTEGRATION}/trainer.py", "MultiTaskFullyAsyncTrainer", Parent,
         omega_conf_to_dataclass=converter, MultiTaskCheckpointEngineManager=factory, asyncio=asyncio,
     )
     trainer = trainer_class()
-    trainer.config = SimpleNamespace(actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(checkpoint_engine=object())))
     trainer.actor_wg = object()
     replicas = [object(), object()]
     trainer.rollouter = SimpleNamespace(get_replicas=SimpleNamespace(remote=AsyncMock(return_value=replicas)))
@@ -250,4 +257,6 @@ def test_trainer_uses_rollouter_replica_projection_for_native_checkpoint_manager
     converter.assert_called_once_with(trainer.config.actor_rollout_ref.rollout.checkpoint_engine)
     factory.assert_called_once_with(config=checkpoint_config, actor_wg=trainer.actor_wg, replicas=replicas)
     assert trainer.checkpoint_manager is factory.return_value
+    assert trainer.checkpoint_manager.parameter_validation_enabled is False
+    assert trainer.checkpoint_manager.source_validation_enabled is False
     assert not hasattr(trainer, "group_scheduler")

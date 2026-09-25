@@ -23,7 +23,11 @@ D0–D4 的目标链路为：
 
 本轮不把生产级 sleep、wake、drain、reclaim、destroy 算入 D0–D4 的完成条件。这些接口目前只保留预留或测试清理行为，不能用测试 teardown 证明生产生命周期已经实现。
 
-当前 D4_test.sh 在训练结束后执行 smoke，只检查 endpoint 和 LB 名录，不能单独作为综合验收。综合验收必须补充真实生成请求、CE 状态、参数版本和清理结果的核验。
+`D4_test.sh` 默认保留训练结束后的 command-chain smoke；只有显式设置 `D4_E2E_TEST=1`
+才启用训练前创建、训练期保留 borrowed runtime、真实生成和普通 CE 同步的 E2E fixture。
+综合脚本对 S1–S5、S7–S9、S16 自动启用该模式，并以一条完整结构化回执判定结果。
+本机尚未执行真实 NPU 验收；“已有可执行入口”不表示场景已经通过。实现和本地验证记录见
+[D0_D4_e2e_develop.md](D0_D4_e2e_develop.md)。
 
 ## 2. 验收分层
 
@@ -74,10 +78,12 @@ driver、Ray worker、vLLM server 和 plugin 必须从同一套源码及 Python 
 
 ### 4.1 时序图
 
+下面展示当前同任务测试夹具的正例顺序。placement 输入来自真实 donor 快照，由测试
+fixture 构造；它不代表独立 Task 间的 GS 授权、调度策略或公平性已经经过验收。
+
 ```mermaid
 sequenceDiagram
     participant D as Test Driver
-    participant G as Group Scheduler
     participant T as TaskRunner
     participant R as Rollouter
     participant M as LLM Manager
@@ -85,8 +91,7 @@ sequenceDiagram
     participant L as Load Balancer
     participant S as Borrowed Server
 
-    D->>G: 读取任务句柄和 placement 授权
-    G->>T: create spec
+    D->>T: 测试 fixture 提供 donor 快照构造的 create spec
     T->>R: create_borrowed_replica
     R->>M: 创建 CE Worker 和 HTTP Server
     M->>S: launch engine
@@ -104,15 +109,24 @@ sequenceDiagram
     L-->>D: borrowed server handle
     D->>S: generate
     S-->>D: TokenOutput 和 serving version
-    D->>C: 下一轮普通 update_weights
+    T->>C: 委托原生训练循环，optimizer 更新后普通 update_weights
     C-->>S: 全成员同步
+    D->>S: 新版本真实 generate
     D->>T: test teardown
     T->>C: unregister_replica
     T->>M: 删除测试路由并清理 runtime
-    M-->>G: 返回清理证据
+    T->>C: 恢复 donor，真实同步最新参数
+    D->>L: 恢复 donor 路由并生成
+    T-->>D: 一条完整 E2E 结果
 ```
 
 ### 4.2 硬检查
+
+以下 A–G 是整体设计门槛，包含正向路径、契约单元检查和待实现的故障注入。本轮同机
+E2E 的实际真机范围以第 7 节最终回执为准：创建/placement、bootstrap、真实生成、
+原生训练后的普通同步、版本推进及测试清理/恢复。每个 S 正例不会主动注入验证所有
+A–G 断言；例如 pending/READY 前不可见、替换 handle 拒绝主要由契约测试覆盖，
+底层 communicator 无残留也不能由一条上层状态回执独立证明。
 
 #### A. Native 基线
 
@@ -168,7 +182,7 @@ READY 前调用 acquire_server，必须失败或看不到新 borrowed server。R
 - borrowed 被纳入 effective set；
 - donor 被正确排除或恢复，不能形成重复物理 device rank；
 - borrowed serving_version 更新到新 actor version；
-- native 服务和生成不受影响；
+- donor 在测试借用窗口从路由和 CE effective set 暂停，清理 borrowed 后恢复并同步最新参数；
 - 同步后再次生成成功；
 - 通信域 finalize 完成，无残留 communicator。
 
@@ -181,61 +195,81 @@ READY 前调用 acquire_server，必须失败或看不到新 borrowed server。R
 → unregister borrowed CE member
 → 从 LB 移除测试路由
 → 关闭 borrowed server/engine/Worker
-→ 检查 Actor、子进程、端口和设备显存
+→ 独立核验 Actor/engine 执行已退出、HTTP 端口关闭
 → 核对 donor PG、Worker、server 仍存在且可恢复
+→ donor 同步最新参数并真实生成，验证资源可重新使用
 ```
 
-清理 receipt 必须显式记录 errors、kill_requested、release_confirmed、lb_removed、ce_unregistered 和 donor_pg_preserved。只出现 D4_RUNTIME_CLEANUP，或只返回 DESTROYED，不能证明清理成功。
+最终 `cleanup` 必须确认测试资源释放、LB 移除、CE 注销、donor PG 保留及 donor 最新版本恢复；
+`cleanup.borrowers` 保存各 runtime 的实际清理诊断，包括 Actor RPC 状态、Actor/engine
+进程身份、端口状态和错误。`release_confirmed` 表示测试 runtime 的执行资源已核验释放，
+生产 claim 的 `released` 仍为 false。只出现 `D4_RUNTIME_CLEANUP` 或 `DESTROYED`
+不能证明清理成功。进程退出与被父进程回收分别记录，未回收的 zombie 不冒充 PID 消失。
+本轮没有实现 `npu-smi` 逐卡显存回到基线的量化审计；进程/端口观察与 donor 恢复后的
+真实同步、生成证明可重新使用，不应写成已经取得显存数值审计。
 
 ## 5. 场景矩阵
 
-每个成功场景执行 A–G；失败场景执行到预期失败点，然后执行清理核验。
+成功场景执行当前已实现的正向路径并采集第 7 节证据；负例执行到对应预期失败点并核验
+清理。A–G 中尚缺真实注入的检查依然保留在相应 `BLOCKED` 场景，不由正例替代。
 
 | 编号 | 场景 | spec/资源布局 | 关键检查 | 当前状态 |
 | --- | --- | --- | --- | --- |
 | S0 | 原生基线 | 无 borrowed | 生成、参数同步、server/PG 正常 | D0 有基础脚本，需纳入综合运行 |
-| S1 | 单 PG 基础 | 一个 native PG，borrower 使用授权 claims | RUNTIME_READY、bootstrap、LB、真实生成 | D2/D3/D4 分别覆盖，未串成完整请求流程 |
-| S2 | 一拆二 | donor 4 卡；创建两个 world_size=2 borrowed | 两个 lease/rank/server 独立；claim 不重叠；分别 bootstrap 和生成 | 当前 D2 smoke 未覆盖两个 borrower 同时创建 |
-| S3 | 二合一 | 两个 world_size=2 donor PG；一个 world_size=4 borrower | 跨 PG rank 重新编号；四 Worker、一个 engine 拓扑一致 | 当前 cross_pg 只选少量 claim，不能代替 |
-| S4 | 碎片化 bundle | 同一/多个 PG 选择非连续 bundle，如 1、3、0、2 | 实际 bundle 与 claim 逐条匹配 | 有 D2 证据，需接入 CE/LB/生成 |
-| S5 | 多 Worker 共 bundle | 同一 PG/bundle 上两个 fractional borrower claim，donor engine 休眠后串行创建 | 验证多个 CE Worker 可以复用同一 bundle 的 fractional slot；每个 runtime 单独清理；不同时加入 HCCL effective set | 已加入 `D4_test.sh shared_bundle`；当前只给 placement/清理证据，不宣称同时接流 |
-| S6 | 跨节点均匀 | 每节点相同 Worker 数 | node/local rank、server 分组、通信域 | 单机 8 卡不能证明 |
-| S7 | 异构 world_size | 两个 TP=2 native donor 的 claims 合并为一个 TP=4 borrower | donor rank 不复用，borrower rank 连续，跨 PG claims 的实际 device 一一对应 | 已加入 `D4_test.sh merge_world_size`；仍缺真实生成/同步 |
-| S8 | 同 lease 重试 | 相同 spec、相同 lease，TaskRunner 连续发出两次 create RPC | 一个 runtime、同一 rank/server/Worker 集合，第二次只返回已有 receipt | 已加入 `D4_test.sh idempotent`；阶段证据，仍缺生成验收 |
-| S9 | 并发重复 | TaskRunner 内两个并发调用同时提交同 lease | 一个 rank、一个 Worker/engine 集合，锁和 lease 幂等共同生效 | 已加入 `D4_test.sh concurrent_idempotent`；阶段证据，仍缺压力/生成验收 |
+| S1 | 单 PG 基础 | 一个 native PG，borrower 使用授权 claims | 创建、bootstrap、逐 rank 真实生成、训练期普通同步和清理 | E2E 入口已实现；真实设备待验收 |
+| S2 | 一拆二 | donor 4 卡；两个 world_size=2 borrowed 同时存在 | 独立 lease/rank/server、不重叠 claims；两者均生成、参与训练和同步 | E2E 入口已实现；严格核对 `[2,2]`，真实设备待验收 |
+| S3 | 二合一 | 两个 world_size=2 donor PG；一个 world_size=4 borrower | 全部四个 claim 合并，跨 PG 实际设备、生成和普通同步 | E2E 入口已实现；严格核对 donor `[2,2]`、borrower `[4]` |
+| S4 | 碎片化 bundle | 真实 donor 的非连续 `source_claims[::2]` | 实际 bundle/device 对应；真实生成、普通同步和清理 | E2E 入口已实现；真实设备待验收 |
+| S5 | 多 Worker 共 bundle | 同一 PG/bundle 的两个 world_size=1 fractional runtime | A 生成/同步 → A 暂停 → B 生成/训练/同步 → B 暂停 → A 最新参数恢复并生成；两者清理 | E2E 入口已实现；串行激活，不要求同设备两个 active CE rank |
+| S6 | 跨节点均匀 | 每节点相同 Worker 数 | node/local rank、server 分组、通信域 | `BLOCKED`：缺少多机环境及跨节点 fixture |
+| S7 | 异构 world_size | 两个 TP=2 donor 合并为一个 TP=4 borrower | donor/borrower rank 独立，四 Worker 实际 placement、生成和普通同步 | E2E 入口已实现；真实设备待验收 |
+| S8 | 同 lease 重试 | 相同 spec/lease，串行 create 两次 | 同 rank/server、仅一套 runtime，再完成真实生成/训练/同步/清理 | E2E 入口已实现；真实设备待验收 |
+| S9 | 并发重复 | 两个并发调用同时提交同 lease | 同 rank/server、仅一套 runtime，再完成真实生成/训练/同步/清理 | E2E 入口已实现；不替代跨 Task 并发 |
 | S10 | lease 冲突/过期 | 相同 lease 不同 spec；expired lease | 创建前拒绝，无 Actor/PG 副作用 | 有契约单测，需真实入口 |
 | S11 | PG/设备错误 | missing PG、duplicate device、错误 node/GPU | 不 READY；donor 不受损；清理可确认 | D2 负例部分覆盖 |
 | S12 | Worker/engine 局部失败 | Worker 失败、OOM、端口冲突或超时 | 不发布 LB；清除部分资源；donor 恢复 | 当前缺少完整故障注入 |
 | S13 | CE bootstrap 失败 | finalize、通信域或目标 Worker 更新失败 | pending/失败态；不接流；可诊断 | 有 CE 单元，需真实 backend 证据 |
 | S14 | LB RPC 不确定 | LB 写入后模拟响应丢失 | 查询实际路由再重试/失败；不重复或漏删 | 当前未覆盖 |
-| S15 | 多任务借用 | Task A donor、Task B borrower、GS 授权 claims | borrower 不持 donor handle；两任务可继续 | 当前 smoke 是同 manager 本地 donor |
-| S16 | 请求压力边界 | READY 后并发多个 request | inflight、sticky 路由、释放计数和输出 | 当前未覆盖真实生成压力 |
+| S15 | 多任务借用/公平性 | 独立 Task A donor、Task B borrower、GS 授权 claims | 任务隔离、两任务继续运行、跨任务分配公平性 | `BLOCKED`：缺少独立 Task fixture 和调度公平性验证 |
+| S16 | 请求压力边界 | bootstrap 后及训练同步后各发至少四个并发真实请求 | request/server/token/version、路由恢复和 inflight 归零 | E2E `pressure` 已实现；有界并发验收，真实设备待验收 |
 
 ### 5.1 各场景实际执行步骤与当前可测试性
 
-下面的“实际步骤”描述当前仓库中的脚本真正执行的调用链，不是目标架构中的理想流程。`可直接执行`表示当前 1 节点 8 卡、4 张训练 NPU 加 4 张 rollout NPU 的机器具备入口；`可执行但不完整`表示能启动已有阶段测试，但不能证明该场景的全部验收条件；`不可执行`表示当前没有对应测试入口或硬件条件。
+下面描述综合脚本当前调用的 E2E 模式。`可直接执行，待实测`表示面向 1 节点 8 卡、
+4 张训练 NPU 加 4 张 rollout NPU 的目标服务器已有完整入口，本机没有运行设备验收。
+单独运行不带 `D4_E2E_TEST=1` 的 `D4_test.sh` 仍是旧 smoke。
+
+E2E 共用顺序为：native 初始化 → 暂停 donor CE → 摘除原 native LB 路由 → 测试休眠
+donor engine → 真实 create、
+target-only bootstrap、LB READY → 每个 borrowed rank 的真实生成 → 委托原生训练循环，
+记录 borrowed 请求审计和 optimizer 后普通 CE 同步 → 新版本再次生成 → 测试清理 →
+donor 最新参数同步、恢复路由并生成 → 输出唯一 `D0_D4_E2E_RESULT`。fixture 不新增训练入口。
+E2E 默认执行两个真实 training step；旧 smoke 仍默认一步，可通过
+`D4_TOTAL_TRAINING_STEPS` 调整。
 
 | 场景 | 当前脚本实际经历的步骤 | 当前条件下的结论 |
 | --- | --- | --- |
 | S0 | `D0_D4_comprehensive_test.sh` → `multi_task_run.sh` → native `main_ppo`；创建原生训练/rollout 资源，执行 native rollout、训练和原生参数同步，进程退出后检查日志。 | **可直接执行**。可以证明 native baseline 可运行，但当前脚本没有导出结构化 native inventory，也不能证明 borrowed 生命周期。 |
-| S1 | `D4_test.sh basic`；native replica 初始化 → 从真实 PG/bundle/device 构造 spec → 测试辅助 sleep donor engine → 从 CE effective set 暂停 donor → 创建 borrowed CE Worker、HTTP Server、vLLM Engine → CE 注册 → target-only bootstrap → LB `commit_ready` → endpoint/LB 查询 → 移除测试路由 → kill borrowed Actor → 测试辅助 wake donor → 恢复 donor CE membership。 | **可执行但不完整**。创建、CE bootstrap、LB_READY 和测试清理可执行；没有真实 generate、样本生产期间的普通参数同步、生产 reclaim/destroy。 |
-| S2 | 与 S1 相同，但 `_build_d2_test_spec("split")` 只取一个 donor 的部分 claims，创建一个 world_size=2 的 borrowed replica。 | **可执行但不完整**。验证了 4 卡 donor → 2 卡 borrower 的部分拆分；没有验证一个 donor 同时拆成两个 borrower。 |
-| S3 | `D4_test.sh cross_pg` 将 rollout TP 调为 2，先创建两个较小的 native PG，再从不同 PG 各取一个 claim，重编号后创建一个跨 PG borrowed runtime，执行 CE bootstrap、LB_READY、endpoint 检查和测试清理。 | **可执行但不完整**。验证了跨 PG claim；当前并不是两个 world_size=2 donor 合成为一个 world_size=4 borrower。 |
-| S4 | 与 S1 相同，但选择 `source_claims[::2]` 形成非连续 bundle，随后执行真实 Worker/Server/Engine 创建、CE bootstrap、LB_READY、endpoint 检查和测试清理。 | **可执行但不完整**。可以验证单个碎片化 placement；缺少真实生成和后续普通同步。 |
-| S5 | `D4_test.sh shared_bundle`；native donor 初始化 → 读取同一 bundle claim → donor engine 测试休眠 → 以较小 fractional GPU/CPU claim 创建 borrower A → 休眠 A → 在相同 bundle 创建 borrower B → 分别 kill/清理 A、B → 唤醒 donor。该路径只创建/校验 CE Worker 和 runtime placement，不注册 CE、不创建 LB 路由。 | **可执行但不完整**。可以在 1 节点 8 卡上验证 Ray fractional placement 和清理隔离；由于 HCCL 校验每个物理 bundle 只能有一个 active CE member，且同卡多 vLLM engine 会触发显存竞争，不能把同时接流作为通过条件。 |
+| S1 | E2E `basic` 使用一个 donor 的授权 claims，执行共用顺序。 | **可直接执行，待实测**。必须同时具备真实 token、训练请求、最终参数普通同步和清理证据。 |
+| S2 | E2E `split` 将一个四卡 donor 的完整 claims 分为两份，为两个独立 lease 创建 `[2,2]` borrowed；两个 runtime 保留到训练和同步完成。 | **可直接执行，待实测**。逐 rank 检查前后生成、训练审计和普通同步；缺少任一 borrower 证据即 `FAIL`。 |
+| S3 | E2E `cross_pg` 使用两个 TP=2 donor 的全部四个 claims，创建一个 TP=4 borrower，执行共用顺序。 | **可直接执行，待实测**。严格要求两个 PG、donor `[2,2]`、borrower `[4]`，不再沿用旧 smoke 的每 PG 一个 claim。 |
+| S4 | E2E `fragmented` 保留非连续 bundle 构造，核对实际 node/device，再执行共用生成、训练、同步和清理顺序。 | **可直接执行，待实测**。不是仅检查 placement 或 endpoint。 |
+| S5 | E2E `shared_bundle`：A bootstrap/生成/当前版本普通同步 → A CE 注销并测试暂停 → B bootstrap/生成 → 原生训练及 B 的新版本普通同步/生成 → B 暂停 → A 重新注册、真实 bootstrap 到最终版本并生成 → A/B 清理 → donor 恢复。 | **可直接执行，待实测**。`activation_order=[A,B,A]`；前后生成覆盖 A/B，训练审计及 optimizer 普通同步只要求训练期 active B；两者不能同时进入同设备 HCCL effective set。 |
 | S6 | 当前没有跨节点启动器或多节点资源配置；不能进入真实多节点 PG、node rank 和 HCCL 通信域验证。 | **不可执行**。当前只有 1 个节点。 |
-| S7 | `D4_test.sh merge_world_size` 将 rollout TP 设为 2，收集两个 native donor 的全部 claims，合并成 world_size=4 spec，执行 borrowed CE/HTTP/Engine 创建、CE bootstrap、LB_READY、endpoint 检查和清理。 | **可执行但不完整**。可以在单机上验证 2+2→4 的 rank/device 构造；没有真实生成和后续普通同步。 |
-| S8 | `D4_test.sh idempotent`；第一次 create 完成 CE bootstrap/LB_READY，第二次以完全相同 lease/spec 发送 create，核对返回相同 rank/server 和单一 Worker/Engine 快照，然后只清理一次。 | **可执行但不完整**。真实 Ray 重试路径可执行；仍缺生成期间的请求幂等和参数同步验收。 |
-| S9 | `D4_test.sh concurrent_idempotent`；同一个 TaskRunner 用两个线程同时调用 create，内部操作锁和 manager lease 幂等保证只执行一次实际创建；核对两个 receipt、rank/server 和 runtime 快照，再清理一次。 | **可执行但不完整**。可以验证真实 Actor 内并发 duplicate create；不能替代跨任务 GS 并发和请求压力测试。 |
+| S7 | E2E `merge_world_size` 将 rollout TP 设为 2，合并两个 donor 全部 claims 为 TP=4，并执行共用顺序。 | **可直接执行，待实测**。与 S3 使用同样严格的四 Worker/双 PG、生成和同步证据。 |
+| S8 | E2E `idempotent` 串行两次 create，检查同 rank/server 和一套 runtime，随后该 borrowed 完整参与生成、训练、同步及清理。 | **可直接执行，待实测**。三项幂等字段和完整 E2E 证据均须成立。 |
+| S9 | E2E `concurrent_idempotent` 用两个线程并发提交相同 spec/lease，检查一套 runtime，再执行共用顺序。 | **可直接执行，待实测**。测试任务内并发 duplicate create；跨 Task 并发及公平性留在 S15。 |
 | S10 | `D2_runtime_test.sh expired`；native 初始化 → 构造已过期 spec → 在创建 Worker 前被 placement/lease 校验拒绝 → 输出 `EXPECTED_FAILURE` → 主训练流程继续并清理 native 资源。 | **可直接执行**。可以验证 expired lease 不进入 `RUNTIME_READY`；不能替代完整 lease 冲突重试测试。 |
 | S11 | `D2_runtime_test.sh missing_pg,duplicate_device`；native 初始化 → 构造缺失 PG 或重复设备的 spec → 创建前校验失败 → 输出预期失败 receipt → 检查没有发布 borrowed runtime。 | **可直接执行**。可以验证两类 placement 负例；Worker 中途失败、OOM、端口冲突仍没有真实注入。 |
 | S12 | 当前没有第 N 个 Worker 失败、Engine OOM、端口冲突或启动超时的可控注入参数。 | **不可执行**。不能用一次自然 OOM 代替可重复的故障验收。 |
 | S13 | 当前没有让 CE register、target-only bootstrap、通信域 finalize 或目标 Worker 更新可控失败的 main_ppo 入口。 | **不可执行**。已有 CE 单元测试不能证明真实 HCCL 失败后的资源状态。 |
 | S14 | 当前没有让 LB `commit_ready`/remove RPC 在写入后丢失响应的测试代理，也没有查询后幂等重试入口。 | **不可执行**。不能证明 LB 不确定提交的最终路由一致性。 |
-| S15 | 当前 D4 smoke 的 donor 和 borrower 都属于同一个 TaskRunner/LLMServerManager；没有两个独立任务、GS 授权快照和跨任务 RPC 启动器。 | **不可执行**。不能证明 borrower 不持有 donor 句柄或跨任务继续运行。 |
-| S16 | D4 只调用 `get_server_address` 和 `get_all_servers` 检查 endpoint/LB 名录，没有通过客户端发送 prompt，也没有并发请求驱动器。 | **不可执行**。不能验证真实样本、inflight 计数、sticky 路由或压力下的释放。 |
+| S15 | 当前 fixture 的 donor/borrower 位于同一 Task；缺少两个独立 Task、真实 GS 授权和公平性负载。 | **BLOCKED**。不得由本地 donor fixture 推导跨 Task 隔离或公平性通过。 |
+| S16 | E2E `pressure` 在 bootstrap 后和原生训练最终同步后，分别通过原生客户端并发发起四个请求，核对每个请求的目标 server、非空 token 和实际版本，再恢复路由并清理。 | **可直接执行，待实测**。两阶段 `concurrency>=4` 且每 rank 至少四个独立请求；这是有界压力边界，不是吞吐基准。 |
 
-因此，当前机器上可以逐个直接运行 `S0、S1、S2、S3、S4、S5、S7、S8、S9、S10、S11`；其中 S1–S5、S7–S9 是阶段链路或资源约束验证，严格综合验收仍应标记为 `INCOMPLETE`。S6、S12–S16 不能在当前实现和硬件条件下直接完成综合验收。
+目标单机服务器可逐个执行 `S0、S1、S2、S3、S4、S5、S7、S8、S9、S10、S11、S16`。
+S1–S5、S7–S9、S16 的结果由真实运行回执决定，不硬编码 `PASS` 或 `INCOMPLETE`。
+S6、S12–S15 仍为 `BLOCKED`。本机单元测试通过不能替这些场景生成设备验收记录。
 
 ## 6. 故障注入与不变量
 
@@ -261,7 +295,9 @@ READY 前调用 acquire_server，必须失败或看不到新 borrowed server。R
 
 ## 7. 证据格式
 
-每个场景保存：
+当前脚本实际保存 `environment.json`、逐场景运行日志、`results.tsv` 和 `summary.json`。
+E2E 日志中的唯一最终回执保存 topology、bootstrap、普通同步、生成、训练审计和清理信息。
+排查复杂部署时可额外拆分保存下列证据；这些独立文件名不是当前脚本全部自动生成的承诺：
 
 ```text
 environment.json
@@ -277,9 +313,25 @@ stdout.log
 stderr.log
 ```
 
-每条 receipt 至少包含 scenario、operation_id、lease_id、replica_rank、state、world_size、serving_version、server_id、ce_registered、bootstrap_finalized、lb_registered、generated_request_ids、released 和 error。
+创建阶段日志保留 operation_id、lease_id、replica_rank、world_size、state 等字段。
+E2E 最终回执以 `D0_D4_E2E_RESULT ` 后的一行 JSON 为准，`schema_version=1`：
 
-训练成功的唯一判据是插件 Trainer 输出的结构化回执：
+| 字段 | 必须可核对的事实 |
+| --- | --- |
+| `scenario/state` | 与选定场景一致；必须为 `PASSED`，但状态字段单独不构成通过 |
+| `training` | `completed=true`、`state=COMPLETED`、正整数 `completed_steps==target_steps`，以及最终 `current_param_version` |
+| `topology/bootstrap_versions` | 真实 borrowed rank/world size/donor/PG，场景约束及每 rank 首次版本；S5 还需 active B 与 `[A,B,A]` |
+| `normal_syncs` | `origin=optimizer_loop` 的最终新版本覆盖全部训练期 borrowed rank；逐 rank 确认版本/Worker 数与 effective set 一致 |
+| `normal_syncs[].parameter_validation` | source/receiver 校验状态、同版本、正参数数量/numel、相同 manifest digest；Worker 总数匹配同步映射 |
+| `generation_before/after` | 每 rank 的原生客户端请求，实际 acquired server、独立 request ID、非空 token、bootstrap/最终版本；S16 两阶段均至少四请求并发 |
+| `training_audits` | 每个训练期 active rank 有真实非空完成请求，无失败和残留 inflight；S5 仅要求 B |
+| `cleanup` | 每个 borrower 的资源释放证据、CE/LB 移除、donor PG 保留、最终版本真实同步和 donor 真实生成 |
+
+`e2e_verdict.py` 只使用 Python 标准库，按绝对源码文件路径执行。它要求训练进程实际退出码
+为 0、日志中恰好一条 marker、JSON 完整且内部证据一致。缺失、重复、矛盾、解析失败或
+进程失败都返回 `FAIL`，不会从不同日志行或多个运行拼接成功证据。
+
+插件 Trainer 的训练完成回执如下；E2E 最终回执包含同一训练对象，严格核对步数：
 
 ```text
 MULTITASK_TRAINING_COMPLETE {"state": "COMPLETED", "completed": true,
@@ -307,26 +359,36 @@ Actor rank 0 同时生成 source manifest，Manager 对 source 与每个 CE Work
 
 ## 8. 一键综合脚本实现
 
-已新增 `D0_D4_comprehensive_test.sh`。脚本每次只接受一个场景名，不会在同一个 Ray/显存生命周期内串行运行多个场景。它使用 `tee` 将 native verl、Ray、vLLM 和训练日志实时打印到控制台，同时保存独立日志，并生成 `environment.json`、`results.tsv` 和 `summary.json`。结果区分真实通过、阶段路径通过但证据不足（`INCOMPLETE`）和当前没有实现入口（`BLOCKED`）。每个可训练场景都要求严格的全 step 完成回执；D0、D3、D4 还要求 CE Worker 逐参数校验回执。
+`D0_D4_comprehensive_test.sh` 每次只接受一个场景名。它使用 `tee` 实时打印并保存 native
+verl、Ray、vLLM 和训练日志，生成 `environment.json`、`results.tsv` 和 `summary.json`。
+S1–S5、S7–S9、S16 自动传入 `D4_E2E_TEST=1`；`D4_test.sh` 禁用旧
+`multitask.d4_runtime_test`、启用 `multitask.e2e_test`，沿用原训练入口。
+子脚本检查实际训练进程与 `tee` 退出码并验证唯一 E2E 回执，综合脚本再核对其捕获日志。
+`INCOMPLETE` 仍属于汇总格式，但这些正例已不再固定返回该状态。
 
 当前映射如下：
 
 | 场景 | 执行入口 | 当前判定 |
 | --- | --- | --- |
 | S0 | `multi_task_run.sh`，只启用 CE 接收侧逐参数校验，不启用 borrowed smoke hook | 必须有全 step 完成回执和 CE manifest 校验才为 `PASS`；默认 `nccl` 不做 source manifest 比对 |
-| S1 | `D4_test.sh basic` | 当前 D4 只验证到 LB/endpoint，因此为 `INCOMPLETE` |
-| S2 | `D4_test.sh split` | 只创建一个拆分后的 borrower，尚未验证两个 borrower 同时存在，为 `INCOMPLETE` |
-| S3 | `D4_test.sh cross_pg` | 当前只验证跨 PG claim，尚未验证 2+2 合成 world_size=4，为 `INCOMPLETE` |
-| S4 | `D4_test.sh fragmented` | placement 和 runtime 路径可执行，但缺少真实 generate/后续 sync，为 `INCOMPLETE` |
-| S5 | `D4_test.sh shared_bundle` | 同 bundle fractional CE placement/清理可执行；HCCL/LB 同时接流受约束，为 `INCOMPLETE` |
-| S7 | `D4_test.sh merge_world_size` | 2+2→4 合并路径可执行，但缺真实 generate/后续 sync，为 `INCOMPLETE` |
-| S8 | `D4_test.sh idempotent` | 真实 Ray 重试只保留一个 runtime，为 `INCOMPLETE` |
-| S9 | `D4_test.sh concurrent_idempotent` | 真实 TaskRunner 并发重复只保留一个 runtime，为 `INCOMPLETE` |
+| S1 | E2E `basic` | 单 rank 完整结构化回执通过才 `PASS` |
+| S2 | E2E `split` | `[2,2]` 两 rank 完整生成/训练/普通同步/清理证据通过才 `PASS` |
+| S3 | E2E `cross_pg` | 双 donor `[2,2]`、双 PG → borrower `[4]` 及完整回执通过才 `PASS` |
+| S4 | E2E `fragmented` | 碎片 placement 实测和完整回执通过才 `PASS` |
+| S5 | E2E `shared_bundle` | `[1,1]`、A→B→A、两 rank 前后生成、B 训练后普通同步和两者清理通过才 `PASS` |
+| S6 | 跨节点环境/fixture | `BLOCKED` |
+| S7 | E2E `merge_world_size` | 2+2→4 实测和完整回执通过才 `PASS` |
+| S8 | E2E `idempotent` | 串行重试同 rank/server/一套 runtime 及完整回执通过才 `PASS` |
+| S9 | E2E `concurrent_idempotent` | 并发 create 同 rank/server/一套 runtime 及完整回执通过才 `PASS` |
 | S10 | `D2_runtime_test.sh expired` | 预期拒绝且无 READY 才为 `PASS` |
 | S11 | `D2_runtime_test.sh missing_pg,duplicate_device` | placement 负例均按预期失败才为 `PASS` |
-| S12、S13、S14、S16 | 暂无真实故障注入或请求压力入口 | `BLOCKED` |
+| S12、S13、S14 | 缺少可控真实故障注入 | `BLOCKED` |
+| S15 | 缺少独立 Task/公平性 fixture | `BLOCKED` |
+| S16 | E2E `pressure` | 前后各至少四并发真实请求及完整回执通过才 `PASS` |
 
-成功路径必须经由真实 `main_ppo`，并执行现有的 create → CE bootstrap → LB READY → 测试清理链路；脚本不会把未实现的 generate、普通同步、并发或故障注入伪装成通过。多节点/多任务场景仍需额外 harness。
+成功路径必须经由真实 `main_ppo`。fixture 只负责测试窗口和证据采集；真实模型生成、
+optimizer、参数传输、CE 和 LB 使用已有实现。多节点、独立 Task、公平性和故障注入
+场景仍需相应环境及 fixture。
 
 返回值：
 
@@ -336,7 +398,7 @@ Actor rank 0 同时生成 source manifest，Manager 对 source 与每个 CE Work
 2  环境/版本/硬件不满足，或存在 INCOMPLETE/BLOCKED 场景
 ```
 
-现有脚本仍是阶段回归：
+默认 D2/D3/D4 smoke 与新的综合 E2E 可分别运行：
 
 ```bash
 D2_RUNTIME_SCENARIOS=basic,split,fragmented,cross_pg bash ../D2_runtime_test.sh
@@ -352,23 +414,28 @@ D4_RUNTIME_SCENARIOS=concurrent_idempotent bash ../D4_test.sh
 # 综合脚本：每次只运行一个场景
 D0_D4_SCENARIOS=S0 bash ../D0_D4_comprehensive_test.sh
 D0_D4_SCENARIOS=S1 bash ../D0_D4_comprehensive_test.sh
+D0_D4_SCENARIOS=S5 bash ../D0_D4_comprehensive_test.sh
+D0_D4_SCENARIOS=S16 bash ../D0_D4_comprehensive_test.sh
 D0_D4_SCENARIOS=S10 bash ../D0_D4_comprehensive_test.sh
+
+# 直接启用同一 D4 E2E 入口；不带开关时仍执行旧 smoke
+D4_E2E_TEST=1 D4_RUNTIME_SCENARIOS=split bash ../D4_test.sh
 
 # 批量运行：每次只启动一个场景；无论当前场景成功、失败或阻塞，
 # 脚本都会等待其进程结束并记录结果，然后再启动下一个场景
 bash ../D0_D4_batch_test.sh
 
 # 只运行指定子集；仍然严格串行
-D0_D4_BATCH_SCENARIOS=S0,S1,S2,S3,S4,S5,S7,S8,S9,S10,S11 \
+D0_D4_BATCH_SCENARIOS=S0,S1,S2,S3,S4,S5,S7,S8,S9,S10,S11,S16 \
   bash ../D0_D4_batch_test.sh
 
 # 批量结果目录包含每个场景的控制台日志、单场景 summary.json，
 # 以及总的 results.tsv 和 summary.json。批量入口不会因为某个场景
 # 返回 FAIL 而提前退出，因此可以一次收集全部场景的结果。
 
-# 只做当前阶段路径回归；仍须查看 summary.json，不能据此宣布综合验收完成
+# 允许已声明的 BLOCKED 项汇总退出为 0；状态仍为 BLOCKED，不是验收通过
 D0_D4_REQUIRE_COMPLETE=0 \
-D0_D4_SCENARIOS=S1 \
+D0_D4_SCENARIOS=S6 \
   bash ../D0_D4_comprehensive_test.sh
 ```
 
@@ -376,7 +443,8 @@ D0_D4_SCENARIOS=S1 \
 分隔的子集。最终返回 0 表示全部通过，返回 1 表示至少一个场景失败，返回 2 表示存在
 环境阻塞或证据不足。
 
-S6、S15 需要多节点或两个独立任务；硬件或 GS 不支持时，脚本必须返回“环境/能力阻塞”，不能自动跳过后报告全部通过。
+S6、S15 分别需要多节点以及独立 Task/公平性 fixture；脚本明确记录 `BLOCKED`，不能自动
+跳过后报告全部通过。运行子集返回 0 只证明该子集，本文件整体门槛仍包含未完成故障场景。
 
 ## 9. 通过标准
 
@@ -392,9 +460,15 @@ D0–D4 综合验收只有在以下条件全部满足时通过：
 8. 目标部署涉及多任务或跨节点时，必须在对应硬件通过；暂不具备时只能标记阻塞；
 9. 生产 sleep/wake/reclaim/destroy 另行验收，不得使用本文件的测试 teardown 冒充生命周期完成。
 
-在实现真实生成、结构化清理结果、LB 不确定提交核对和多任务 harness 之前，当前 D0–D4 只能标记为“阶段测试通过、综合验收未完成”。
+当前同机正例的真实生成、训练期普通同步和结构化清理已具备可执行入口，尚待设备运行
+结果。S12–S14 故障注入及需要的跨节点/多 Task 验收仍未完成，因此不能把正例子集通过
+解释为整个 S0–S16 综合验收完成。
 
-## 10. S5 / S7 / S8 / S9 复测说明（2026-09-25）
+## 10. 历史 smoke 修复说明（2026-09-25）
+
+本节记录 E2E fixture 引入前的服务器反馈修复；其中旧 D4 marker 仍适用于默认 smoke，
+当前综合脚本的步骤、证据和状态以第 5、7、8 节及
+[E2E 开发记录](D0_D4_e2e_develop.md) 为准。
 
 | 场景 | 本次修复与需要查看的证据 |
 | --- | --- |
@@ -417,6 +491,6 @@ D0_D4_SCENARIOS=S7 bash ../D0_D4_comprehensive_test.sh
 D0_D4_BATCH_SCENARIOS=S5,S7,S8,S9 bash ../D0_D4_batch_test.sh
 ```
 
-训练完成标记用于判断**训练步骤**是否完成。D4 smoke 在训练之后执行，若其创建/幂等检查
-失败，该 S 仍为 `FAIL`。阶段链路修复通过后，现有严格综合标准仍可能给出 `INCOMPLETE`，
-表示完整 borrowed 生成/同步/生命周期证据尚未覆盖，而不是这四项修复仍然抛出异常。
+在当时的 smoke 验收中，创建/幂等异常会导致 `FAIL`，阶段路径通过而完整生成/同步证据
+缺失则为 `INCOMPLETE`。该历史结论不再是当前 E2E 正例的固定结果；现在必须检查唯一
+`D0_D4_E2E_RESULT` 的完整内容及实际进程退出码。

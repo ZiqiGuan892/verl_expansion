@@ -4,6 +4,9 @@
 
 D0–D4 的统一综合验收方案见 [comprehensive_acceptance_test.md](comprehensive_acceptance_test.md)。本文件只记录 D4 的实现细节和阶段脚本，不能替代综合验收。
 
+新增的训练期真实 E2E fixture 见 [D0_D4_e2e_develop.md](D0_D4_e2e_develop.md)。
+本文前六节保留默认 D4 smoke 的实现与历史验证；当前综合脚本使用 E2E 模式，见第 7 节。
+
 D4 把 D2 的 borrowed runtime 创建和 D3 的 CE bootstrap 接到一个任务级命令入口：
 
 ```text
@@ -207,4 +210,24 @@ python -m pytest -q -p no:cacheprovider \
 S5 应出现两份真实 placement、`PLACEMENT_READY` 和 cleanup；S7 应完成合并后的
 `RUNTIME_READY -> CE bootstrap -> LB_READY`；S8/S9 应出现各自幂等结果，默认 TP=4
 时 `worker_count=expected_worker_count=4`、`server_count=expected_server_count=1`。
-所有场景还需训练完成与清理证据；严格综合结果可能仍为 `INCOMPLETE`，见验收文档。
+上述为引入 E2E fixture 前的 smoke 复测证据；当时完整生成/同步覆盖不足会记为
+`INCOMPLETE`。当前综合脚本按第 7 节的单条完整 E2E 回执判定。
+
+## 7. 真实 E2E 验收补充（2026-09-25）
+
+`D4_E2E_TEST=1` 关闭旧 D4 smoke 并启用 `multitask.e2e_test`，在原生 fit 前通过已有
+create 入口建立 borrowed runtime，执行真实生成，在原生训练期保留 borrowed 并记录
+optimizer 后普通 CE 同步、source/receiver manifest 和生成审计；结束后验证新版本
+生成、测试资源清理及 donor 最新参数真实同步和生成。默认 D4 smoke 保持原行为。
+E2E 默认训练两步，旧 smoke 仍默认一步。
+
+综合 S1–S5、S7–S9、S16 自动使用此路径。S2 现在同时保留两个 TP=2 borrower；
+S3/S7 使用两个 TP=2 donor 的全部四个 claims；S5 串行激活 A→B 训练→A 恢复；S16
+在训练前后分别发起至少四个并发真实请求。唯一 `D0_D4_E2E_RESULT` 回执必须同时满足
+进程退出码和结构化证据校验，不能仅凭 READY/PASSED 字样，也不再固定返回 INCOMPLETE。
+
+S6 跨节点、S15 独立 Task/公平性仍为 `BLOCKED`。测试 sleep/wake 和 teardown 不代表
+生产生命周期实现。整合单元回归 **252 passed**，未执行依赖指定原生源码接线的
+`test_entry.py` 16 项；三个验收脚本的 Git Bash 语法检查通过。本机未运行真实 NPU E2E。
+文件职责、整合验证与服务器命令见
+[E2E 开发记录](D0_D4_e2e_develop.md)。
