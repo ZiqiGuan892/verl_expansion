@@ -295,6 +295,27 @@ export MT_GPU_TEST_CONFIG=/absolute/path/to/d0-gpu-test-config.json
 
 **验证计划：** 运行现有无 GPU 单元测试，重点检查 CE effective-set 排除/恢复、borrowed bootstrap 和原有 wiring；真实 GPU 验收仍需由后续 lifecycle 实现完成。当前 D3 smoke 中的顺序只用于释放显存并验证 HCCL 重复设备问题，不能替代生产生命周期验收。
 
+### D4 综合回归修复记录（2026-09-25）
+
+**范围：** 处理服务器批量运行 S5/S7/S8/S9 的失败，只修改插件仓库，不改原生 verl。
+
+- `rollout/replica.py`：修复 shared bundle 端口探测任务的 CPU 申请；增加阶段/异常诊断、
+  NPU rank 设备顺序校验和实际映射日志。
+- `experimental_fully_async/llm_server_manager.py`：修复跨 donor 合并 claims 的 NPU 排序，
+  保留真实 PG/bundle 绑定；失败回执保留 traceback。
+- `experimental_fully_async/rollouter.py`：S8/S9 测试操作名映射到 basic placement。
+- `experimental_fully_async/task_runner.py`：单 replica 的 Worker 数量按 world_size 校验，
+  不再硬编码为 1；幂等断言失败也清理已注册 CE。
+- 三个相关单元测试文件新增回归；`issue.md`、`D4_develop.md` 和综合验收文档记录根因、
+  修改内容、验证方法和限制。
+
+**验证结果：** 五个相关单元测试文件共 **60 passed**（仓内 `.venv`，无 Ray/NPU）；
+真实 S5/S7/S8/S9 待服务器复测，不以单元测试代替实际设备验收。
+
+**真实验证：** `D0_D4_BATCH_SCENARIOS=S5,S7,S8,S9 bash ../D0_D4_batch_test.sh`。
+关注创建阶段、`BORROWED_WORKER_PLACEMENT`、S5 placement 回执及 S8/S9 幂等回执；
+严格综合脚本的 `INCOMPLETE` 表示完整覆盖尚未具备，与本次运行异常导致的 `FAIL` 分开记录。
+
 ```
 "multitask.runtime.profile=experimental_fully_async_standalone"
 ```

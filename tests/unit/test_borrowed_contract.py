@@ -9,8 +9,10 @@ placement/engine integration remains a GPU/Ray acceptance test.
 import ast
 import asyncio
 import copy
+import logging
 import math
 import time
+import traceback
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
@@ -36,6 +38,8 @@ def _isolated_class(relative: str, name: str, parent: type, **globals_for_test):
         "copy": copy,
         "math": math,
         "time": time,
+        "logging": logging,
+        "traceback": traceback,
         **globals_for_test,
     }
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), scope)
@@ -259,6 +263,7 @@ def test_native_claim_snapshot_reads_names_from_ray_table(node_count):
         (f"pg-{rank // 2}", f"native-pg-{rank // 2}", rank % 2) for rank in range(len(workers))
     ]
     assert [c["accelerator_id"] for c in claims] == [str(4 + rank % 2) for rank in range(len(workers))]
+    assert [c["local_gpu_index"] for c in claims] == [4 + rank % 2 for rank in range(len(workers))]
     assert [c["node_id"] for c in claims] == [f"node-{rank // 2}" for rank in range(len(workers))]
 
 
@@ -280,6 +285,60 @@ def test_native_claim_snapshot_rejects_missing_registered_name(pg_info):
         asyncio.run(manager._snapshot_native_claims(native, "donor-task"))
     remote.assert_not_called()
     assert not manager.borrowed_operations
+
+
+def test_merge_spec_orders_npu_devices_before_assigning_borrower_ranks():
+    manager = _manager()
+    snapshots = []
+    for donor, devices in enumerate(([4, 5], [6, 7])):
+        snapshots.append([
+            dict(_claim(local), node_id="same-node", node_rank=0, local_rank=local,
+                 pg_id=f"pg-{donor}", bundle_index=local, donor_replica_rank=donor,
+                 accelerator_id=str(device), gpu_uuid=str(device), local_gpu_index=device,
+                 claim_id=f"claim-{donor}-{local}")
+            for local, device in enumerate(devices)
+        ])
+    manager.rollout_replicas = [object(), object()]
+    manager._snapshot_native_claims = AsyncMock(side_effect=snapshots)
+    spec, failed = asyncio.run(manager._build_d2_test_spec("merge_world_size"))
+    assert not failed
+    assert spec["world_size"] == 4
+    assert [c["accelerator_id"] for c in spec["claims"]] == ["4", "5", "6", "7"]
+    assert [c["rank"] for c in spec["claims"]] == [0, 1, 2, 3]
+    assert [c["local_rank"] for c in spec["claims"]] == [0, 1, 2, 3]
+    assert [(c["pg_id"], c["bundle_index"]) for c in spec["claims"]] == [
+        ("pg-0", 0), ("pg-0", 1), ("pg-1", 0), ("pg-1", 1)
+    ]
+    assert [c["local_rank"] for snapshot in snapshots for c in snapshot] == [0, 1, 0, 1]
+
+
+def test_npu_fragmented_claims_sort_numerically_without_changing_bundle_identity():
+    claims = [dict(_claim(i), node_id="node", accelerator_id=device) for i, device in enumerate(["10", "2"])]
+    result = _manager()._reindex_test_claims(claims)
+    assert [c["accelerator_id"] for c in result] == ["2", "10"]
+    assert [(c["pg_id"], c["bundle_index"]) for c in result] == [("pg-1", 1), ("pg-0", 0)]
+
+
+def test_empty_creation_error_retains_type_stage_and_traceback():
+    class FailedReplica(_FakeBorrowedReplica):
+        async def init_from_lease(self, spec):
+            self.creation_stage = "MASTER_ADDRESS"
+            self.cleanup_result = {"kill_requested": [], "errors": [], "release_confirmed": False}
+            try:
+                raise RuntimeError("port task still pending")
+            except RuntimeError as cause:
+                raise TimeoutError() from cause
+
+    manager = _manager()
+    manager.create_borrowed_replica.__globals__["MultiTaskvLLMReplica"] = FailedReplica
+    receipt = asyncio.run(manager.create_borrowed_replica(_spec()))
+    assert receipt["state"] == "FAILED"
+    assert receipt["error"]["message"] == "TimeoutError()"
+    assert receipt["error"]["type"] == "TimeoutError"
+    assert receipt["error"]["stage"] == "MASTER_ADDRESS"
+    assert receipt["error"]["cause"]["message"] == "port task still pending"
+    assert "TimeoutError" in receipt["error"]["traceback"]
+    assert receipt["released"] is False
 
 
 class _ReplicaParent:

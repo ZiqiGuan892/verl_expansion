@@ -141,6 +141,8 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
         prepared = ray.get(rollouter.prepare_d4_runtime_smoke.remote(scenario))
         if prepared.get("expected_failure"):
             raise RuntimeError(f"D4 smoke requires a success scenario: {scenario}")
+        expected_workers = int(prepared["spec"]["world_size"])
+        expected_servers = len({claim["node_id"] for claim in prepared["spec"]["claims"]})
         donor_ranks = [int(rank) for rank in prepared.get("sleeping", {}).get("replica_ranks", [])]
         suspended = False
         replica_rank = None
@@ -156,15 +158,21 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                 # idempotency table must return the same rank and endpoint
                 # without creating another CE worker or HTTP server.
                 result = self.execute_replica_operation("create", prepared["spec"])
-                repeat = self.execute_replica_operation("create", copy.deepcopy(prepared["spec"]))
                 replica_rank = result.get("replica_rank")
+                registered_for_ce = result.get("state") == "LB_READY"
+                repeat = self.execute_replica_operation("create", copy.deepcopy(prepared["spec"]))
                 if replica_rank is None or repeat.get("replica_rank") != replica_rank:
                     raise RuntimeError(f"D4 idempotency allocated different replica ranks: {result} / {repeat}")
                 first_server = (result.get("ready") or {}).get("server_id")
                 repeat_server = repeat.get("server_id") or (repeat.get("ready") or {}).get("server_id")
                 snapshot = ray.get(rollouter.test_operation_snapshot.remote(prepared["spec"]["lease_id"]))
                 same_server = bool(first_server) and first_server == repeat_server == snapshot.get("server_id")
-                one_runtime = snapshot.get("worker_count") == snapshot.get("server_count") == 1
+                # One replica has world_size CE Workers and one server per
+                # node; TP=4 is not evidence of four duplicate replicas.
+                one_runtime = (
+                    snapshot.get("worker_count") == expected_workers
+                    and snapshot.get("server_count") == expected_servers
+                )
                 if not same_server or not one_runtime:
                     raise RuntimeError(
                         "D4 idempotency did not preserve one runtime: "
@@ -180,6 +188,8 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                             "same_server": same_server,
                             "worker_count": snapshot.get("worker_count"),
                             "server_count": snapshot.get("server_count"),
+                            "expected_worker_count": expected_workers,
+                            "expected_server_count": expected_servers,
                         },
                         sort_keys=True,
                     )
@@ -198,6 +208,7 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                 if not ranks or len(set(ranks)) != 1:
                     raise RuntimeError(f"D4 concurrent idempotency allocated different ranks: {results}")
                 replica_rank = int(ranks[0])
+                registered_for_ce = any(item.get("state") == "LB_READY" for item in results)
                 snapshot = ray.get(rollouter.test_operation_snapshot.remote(prepared["spec"]["lease_id"]))
                 servers = {
                     (item.get("ready") or {}).get("server_id") or item.get("server_id")
@@ -206,8 +217,9 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                 servers.discard(None)
                 if (
                     len(servers) != 1
-                    or snapshot.get("worker_count") != 1
-                    or snapshot.get("server_count") != 1
+                    or servers != {snapshot.get("server_id")}
+                    or snapshot.get("worker_count") != expected_workers
+                    or snapshot.get("server_count") != expected_servers
                 ):
                     raise RuntimeError(
                         f"D4 concurrent idempotency created duplicate runtime: results={results}, snapshot={snapshot}"
@@ -222,6 +234,8 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                             "same_server": True,
                             "worker_count": snapshot.get("worker_count"),
                             "server_count": snapshot.get("server_count"),
+                            "expected_worker_count": expected_workers,
+                            "expected_server_count": expected_servers,
                         },
                         sort_keys=True,
                     )

@@ -3,8 +3,10 @@
 import asyncio
 import copy
 import json
+import logging
 import math
 import time
+import traceback
 
 import ray
 
@@ -657,9 +659,25 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             )
             runtime = await replica.init_from_lease(normalized)
         except Exception as exc:
+            # TimeoutError/CancelledError-like wrappers may have empty str().
+            # Keep a serializable chain and log the complete original traceback.
+            error = {
+                "code": "RUNTIME_CREATION_FAILED",
+                "message": str(exc) or repr(exc),
+                "type": type(exc).__name__,
+                "stage": getattr(replica, "creation_stage", "CONSTRUCTOR"),
+                "traceback": traceback.format_exc(),
+            }
+            cause = exc.__cause__ or exc.__context__
+            if cause is not None:
+                error["cause"] = {"type": type(cause).__name__, "message": str(cause) or repr(cause)}
+            logging.getLogger(__name__).exception(
+                "borrowed creation failed: lease=%s replica_rank=%s stage=%s",
+                lease_id, replica_rank, error["stage"],
+            )
             async with self.replica_operation_lock:
                 record["state"] = "FAILED"
-                record["error"] = {"code": "RUNTIME_CREATION_FAILED", "message": str(exc)}
+                record["error"] = error
                 cleanup = getattr(replica, "cleanup_result", None) if replica is not None else None
                 record["result"] = {
                     "operation_id": record["operation_id"],
@@ -768,7 +786,8 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                     "node_id": node_id,
                     "gpu_uuid": worker_info["accelerator_id"],
                     "accelerator_id": worker_info["accelerator_id"],
-                    "local_gpu_index": local_rank,
+                    "local_gpu_index": int(worker_info["accelerator_id"])
+                    if worker_info["accelerator_id"].isdecimal() else local_rank,
                     "node_rank": node_rank,
                     "local_rank": local_rank,
                     "gpu_fraction": 0.5,
@@ -783,7 +802,16 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         node_order: dict[str, int] = {}
         for claim in claims:
             node_order.setdefault(claim["node_id"], len(node_order))
-        ordered = sorted(claims, key=lambda item: (node_order[item["node_id"]], item["local_rank"]))
+        if get_device_name() == "npu":
+            # Donors restart local_rank at zero. Sorting those ranks together
+            # interleaves devices (e.g. 4,6,5,7), invalid for Ascend visibility.
+            # Sort physical placement IDs BEFORE assigning borrower CE ranks.
+            ordered = sorted(
+                claims,
+                key=lambda item: (node_order[item["node_id"]], int(item["accelerator_id"])),
+            )
+        else:
+            ordered = sorted(claims, key=lambda item: (node_order[item["node_id"]], item["local_rank"]))
         local_ranks: dict[str, int] = {}
         for rank, claim in enumerate(ordered):
             node_id = claim["node_id"]
@@ -871,7 +899,9 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
 
         This fixture is isolated from normal D2/D3/D4 paths.  Each borrowed
         CE worker requests 0.25 GPU and 0.5 CPU, so the native donor (0.5 GPU
-        and one CPU) plus both test workers fit one bundle when M=2.  The
+        and one CPU) plus both test workers fit one bundle with 2 CPUs. The
+        short master-port task requests zero CPUs so it can also start after
+        borrower A occupies another 0.5 CPU. M does not count live actors. The
         first borrowed vLLM server is put to sleep before the second starts;
         this keeps NPU memory and HCCL membership safe while still proving
         Ray can place multiple independent workers on the same donor slot.

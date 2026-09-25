@@ -478,3 +478,115 @@ CE suspend + 旧域 finalize
 上述真实 server 操作、in-flight 请求处理、通信域清理/重建、参数追平和 reclaim/destroy
 均在当前代码中保留为 `TODO(lifecycle)`，由其他开发者实现。D3 smoke 当前先使用测试
 sleep 释放显存，再由 Trainer 更新 CE 投影；该顺序仅用于测试，不是生产事务顺序。
+
+## 11. S5、S7、S8、S9 批量回归失败（2026-09-25）
+
+### S5：第二个 shared_bundle borrower 创建失败，错误文本为空
+
+日志节选：
+
+```text
+RuntimeError: shared_bundle create 1 failed: {
+  'replica_rank': 2, 'state': 'FAILED',
+  'error': {'code': 'RUNTIME_CREATION_FAILED', 'message': ''},
+  'cleanup': {'kill_requested': [], 'errors': [], 'release_confirmed': False}}
+```
+
+代码中确认存在一个调度阻塞条件：`_create_workers_from_claims()` 在创建 CE Actor 前，
+先在首个 claim 的 PG/bundle 上运行原生 `get_master_addr_port`。它是普通 Ray task，
+默认申请 1 个逻辑 CPU。S5 bundle 有 2 CPU，donor CE 占 1 CPU，borrower A 占 0.5 CPU，
+即使 A 的 engine 已 sleep，其 CE Actor 的资源预约仍保留，只剩 0.5 CPU。此时 borrower B
+的端口任务不能运行，尽管 B 的 CE 本身只需要 0.5 CPU。
+
+这个条件可以解释超时前没有创建 CE Actor、`kill_requested=[]` 和空 `TimeoutError`
+消息，但原日志没有 traceback，不能仅凭空文本断言本次一定是该异常。
+Ray 的默认任务资源规则见 [Ray Resources](https://docs.ray.io/en/latest/ray-core/scheduling/resources.html)。
+
+修复位于 `src/multi_task_scheduler/rollout/replica.py`：仅为该短暂端口任务设置
+`num_cpus=0`，保留原来的 PG/bundle 调度约束；CE Actor 的 `0.25 NPU + 0.5 CPU`
+申请不变。donor + A + B 总计 `1 NPU + 2 CPU`，不需要为本场景增大 M，也不销毁 donor。
+
+同时记录 `creation_stage`，超时包含阶段、lease、时间上限；Manager 在创建失败时记录
+异常 `type/message/stage/cause/traceback` 并输出完整 traceback，避免下次仍只有空文本。
+`release_confirmed`、`released` 不因记录异常或发出 kill 请求而改成 true。
+
+### S7：merge_world_size 的 NPU 可见设备顺序错误
+
+日志节选：
+
+```text
+torch_npu.npu._lazy_init() -> torch_npu._C._npu_init()
+RuntimeError: ... aclInit, error code is 107001
+[Error]: Invalid device ID.
+value 0 for parameter userDevId is invalid. Expected value: [0, 0).
+```
+
+日志能说明进程无法初始化有效设备，不能单独证明显存耗尽或上一场景有进程残留。
+代码中发现独立且可复现的设备排序缺陷：两个 donor 的 local_rank 都从 0 开始，旧
+`_reindex_test_claims()` 按 donor local_rank 排序。例如 donor A 的设备为 `[4,5]`、
+donor B 为 `[6,7]`，合并后会得到 `[4,6,5,7]`。继承的原生 `launch_servers()` 按 CE
+Worker 顺序拼接设备列表，HTTP Server 将其写入 `ASCEND_RT_VISIBLE_DEVICES`。
+CANN 文档要求此变量内的设备 ID 升序排列，见
+[ASCEND_RT_VISIBLE_DEVICES](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/910/maintenref/envvar/envref_07_0028.html)。
+
+修复：
+
+- 测试 spec builder 按节点分组、按真实 Ray accelerator ID 的**数值**排序，再生成
+  borrower rank/local_rank；保留每项 claim 的 PG/bundle/device/donor 归属。
+- snapshot 的 `local_gpu_index` 使用实际设备索引，避免误把 donor local_rank 当设备号。
+- borrowed placement 校验和实际 CE Worker 校验都检查 NPU 设备顺序。生产 GS spec
+  不被偷偷重排；不满足顺序要求时明确失败。
+- 打印 `BORROWED_WORKER_PLACEMENT`，包含 rank/world_size、node/device、PID 和设备可见性
+  环境变量。原生 HTTP Server 仍负责设置并打印最终 engine 的可见设备列表。
+
+不能只在 HTTP Server 内排序设备字符串而保持 CE ranks 不变，否则 CE 与 engine 的 rank
+设备对应关系可能错位。该修复消除已确认的排序缺陷；本次 ACL 错误是否完全由它引起，
+仍需在服务器复测。如果仍失败，应对照新映射日志与 EngineCore 原始 traceback继续定位，
+不能自动将原因归为残留进程。
+
+### S8 / S9：测试场景名误传给 placement builder，以及 Worker 数量误判
+
+日志节选：
+
+```text
+prepare_d4_runtime_smoke -> _build_d2_test_spec(scenario)
+ValueError: unknown D2 runtime scenario: idempotent
+ValueError: unknown D2 runtime scenario: concurrent_idempotent
+```
+
+`idempotent` / `concurrent_idempotent` 是命令重试方式，不是两种新的 placement 算法。
+`rollouter.py::prepare_d4_runtime_smoke()` 将这两者映射为 `basic` 布局；TaskRunner 仍按
+原场景分别提交串行两次 create 或并发两次 create，不把场景降级成只创建一次。
+
+进一步发现 TaskRunner 原断言 `worker_count == server_count == 1` 也会使默认 TP=4
+的单个 replica 失败。修为 `worker_count == spec.world_size`，
+`server_count == claims 中不同 node_id 的数量`，并继续核对同 rank、同 server。
+回执附带预期数量；若幂等断言失败，已经注册的 borrowed CE 也会在测试 finally 中注销。
+
+注意：`MULTITASK_TRAINING_COMPLETE` 只证明 native 训练步骤完成。D4 smoke 在 native
+训练返回后执行，之后的创建/幂等验证仍可能失败，不能据此前一个标记判定整个 S 通过。
+
+### 验证与服务器复测
+
+本地无 Ray/NPU 回归：`test_borrowed_runtime.py`、`test_borrowed_contract.py`、
+`test_d4_lifecycle.py`、`test_checkpoint_membership.py`、`test_hccl_checkpoint_engine.py`，
+共 **60 passed**。新增用例覆盖剩余 0.5 CPU 时的端口任务请求、空异常诊断、合并设备排序、
+保留 PG/bundle 归属、S8/S9 映射和 TP=4 完整 smoke 控制逻辑（RPC 使用替身），并验证
+错误 Worker 数量仍会失败。本地结果不等价于真实 NPU 运行通过。
+
+在服务器原启动目录、更新插件文件后执行：
+
+```bash
+# 每次一个场景，可分别观察控制台和该场景日志
+D0_D4_SCENARIOS=S5 bash ../D0_D4_comprehensive_test.sh
+D0_D4_SCENARIOS=S7 bash ../D0_D4_comprehensive_test.sh
+D0_D4_SCENARIOS=S8 bash ../D0_D4_comprehensive_test.sh
+D0_D4_SCENARIOS=S9 bash ../D0_D4_comprehensive_test.sh
+
+# 或由现有 batch 严格串行执行这四项，逐项保存结果
+D0_D4_BATCH_SCENARIOS=S5,S7,S8,S9 bash ../D0_D4_batch_test.sh
+```
+
+这些场景目前仍属阶段验证。修复后阶段链路成功时，严格综合脚本仍可能报告
+`INCOMPLETE`（缺少完整 borrowed generate/sync/生命周期证据），不能将其与本次
+`FAIL` 混为一谈，也不修改通过标准来掩盖错误。

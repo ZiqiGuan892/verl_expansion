@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import json
 import time
 from dataclasses import replace
 
@@ -49,6 +50,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
         self.expected_device_map: dict[int, dict] = {}
         self.actual_device_map: dict[int, dict] = {}
         self.cleanup_result: dict = {}
+        self.creation_stage = "NOT_STARTED"
 
     def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
         return RayClassWithInitArgs(
@@ -148,12 +150,42 @@ class MultiTaskvLLMReplica(vLLMReplica):
         if len(devices) != world_size or len(bundles) != world_size:
             raise ValueError("one replica requires distinct devices; share bundles across replicas")
 
+        if get_device_name() == "npu":
+            # Native launch_servers concatenates Worker devices in rank order.
+            # CANN requires ascending ASCEND_RT_VISIBLE_DEVICES. Reject an
+            # invalid GS layout rather than changing its rank/claim identities.
+            for node_rank in nodes:
+                local_claims = sorted(
+                    (c for c in claims if c["node_rank"] == node_rank), key=lambda c: c["local_rank"]
+                )
+                device_ids = [
+                    str(c.get("accelerator_id", c.get("local_gpu_index")
+                              if c.get("local_gpu_index") is not None else c["gpu_uuid"]))
+                    for c in local_claims
+                ]
+                self._validate_npu_device_order(device_ids)
+
         return self._resolve_placement_groups(claims)
+
+    @staticmethod
+    def _validate_npu_device_order(device_ids: list[str]) -> None:
+        if not device_ids or any(not str(device).isascii() or not str(device).isdecimal() for device in device_ids):
+            raise ValueError(f"NPU placement requires numeric Ray accelerator IDs, got {device_ids}")
+        indices = [int(device) for device in device_ids]
+        if indices != sorted(set(indices)):
+            raise ValueError(
+                f"NPU devices must be distinct and ascending in borrower local_rank order, got {device_ids}; "
+                "assign claim ranks before CE Worker creation, not just by sorting the server visibility string"
+            )
 
     async def _create_workers_from_claims(self, groups: dict[str, PlacementGroup], spec: dict) -> None:
         """Create independent workers using native resource-option translation."""
         first = self.claims[0]
+        self.creation_stage = "MASTER_ADDRESS"
         port_ref = get_master_addr_port.options(
+            # This short control task binds a port, uses no accelerator, and
+            # must run even when colocated actors leave less than one CPU.
+            num_cpus=0,
             scheduling_strategy=PlacementGroupSchedulingStrategy(
                 placement_group=groups[first.get("pg_name", first["pg_id"])],
                 placement_group_bundle_index=first["bundle_index"],
@@ -166,6 +198,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
             raise
         job_id = str(ray.get_runtime_context().get_job_id())
         prefix = f"borrowed_{job_id}_{self.replica_rank}_{self.operation_id or 'op'}_"
+        self.creation_stage = "CE_WORKERS"
         for claim in self.claims:
             actor_name = f"{prefix}ce_{claim['rank']}"
             env_vars = {
@@ -206,6 +239,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
         )
         self.worker_group = group
         self.workers = list(group.workers)
+        self.creation_stage = "CE_PLACEMENT_VALIDATION"
         await self._validate_workers()
 
     async def _validate_workers(self) -> None:
@@ -220,6 +254,10 @@ class MultiTaskvLLMReplica(vLLMReplica):
                 "local_world_size": int(os.environ["RAY_LOCAL_WORLD_SIZE"]),
                 "actor_id": str(context.get_actor_id()),
                 "pid": os.getpid(),
+                "visible_devices": {
+                    key: os.environ.get(key)
+                    for key in ("ASCEND_RT_VISIBLE_DEVICES", "ASCEND_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES")
+                },
             }
         infos = await asyncio.gather(*[w.__ray_call__.remote(inspect_worker) for w in self.workers])
         self.actual_device_map = dict(enumerate(infos))
@@ -237,6 +275,15 @@ class MultiTaskvLLMReplica(vLLMReplica):
                 raise RuntimeError(f"CE placement/rank mismatch for claim {claim['claim_id']}: {info}")
         if len({(i["node_id"], i["accelerator_id"]) for i in infos}) != self.world_size:
             raise RuntimeError("multiple engine ranks were placed on one physical accelerator")
+        if get_device_name() == "npu":
+            for offset in range(0, self.world_size, self.gpus_per_replica_node):
+                self._validate_npu_device_order(
+                    [info["accelerator_id"] for info in infos[offset : offset + self.gpus_per_replica_node]]
+                )
+        print(
+            f"BORROWED_WORKER_PLACEMENT {json.dumps({'replica_rank': self.replica_rank, 'workers': infos})}",
+            flush=True,
+        )
 
     async def validate_runtime(self) -> dict:
         """Check server placement and the live engine's own health."""
@@ -290,6 +337,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
         if self.workers or self.servers:
             raise RuntimeError("replica already owns runtime actors; use manager idempotency")
         self.runtime_state = "CREATING"
+        self.creation_stage = "PLACEMENT_VALIDATION"
         try:
             if not spec.get("claims") or spec.get("world_size") != len(spec["claims"]):
                 raise ValueError("borrowed spec must contain one claim per world rank")
@@ -306,13 +354,22 @@ class MultiTaskvLLMReplica(vLLMReplica):
             async def initialize():
                 await self._create_workers_from_claims(groups, spec)
                 self.rollout_mode = RolloutMode.STANDALONE
+                self.creation_stage = "HTTP_ENGINE_START"
                 await self.launch_servers()
+                self.creation_stage = "RUNTIME_VALIDATION"
                 return await self.validate_runtime()
 
-            runtime = await asyncio.wait_for(initialize(), timeout=timeout)
+            try:
+                runtime = await asyncio.wait_for(initialize(), timeout=timeout)
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(
+                    f"borrowed replica {self.replica_rank} creation timeout (limit={timeout:.1f}s) "
+                    f"at stage={self.creation_stage}, lease_id={self.lease_id}: {str(exc) or repr(exc)}"
+                ) from exc
             if time.time() >= spec["expires_at"]:
                 raise ValueError("lease expired while starting runtime")
             self.runtime_state = "RUNTIME_READY"
+            self.creation_stage = "RUNTIME_READY"
             return self.runtime_metadata(runtime)
         except (Exception, asyncio.CancelledError):
             self.runtime_state = "FAILED"

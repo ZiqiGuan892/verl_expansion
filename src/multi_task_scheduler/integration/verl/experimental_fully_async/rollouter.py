@@ -101,7 +101,10 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
         callers receive an already-authorized spec from GS and never invoke
         this helper or invent placement claims locally.
         """
-        spec, expected_failure = await self.llm_server_manager._build_d2_test_spec(scenario)
+        # D4 retry/concurrency cases exercise commands on a basic placement;
+        # they are not new D2 placement algorithms.
+        placement_scenario = "basic" if scenario in {"idempotent", "concurrent_idempotent"} else scenario
+        spec, expected_failure = await self.llm_server_manager._build_d2_test_spec(placement_scenario)
         sleeping = {"state": "NOT_REQUIRED", "replica_ranks": []}
         if not expected_failure:
             sleeping = await self.llm_server_manager.sleep_d4_test_donors(spec)

@@ -175,3 +175,36 @@ Actor PID、实际 node/device 映射以及 cleanup 结果。真实 GPU 测试�
 - GS 当前只保存 TaskRunner handles，尚未实现真实 selected_slots 账务和跨任务调度策略。
 - `D4_test.sh` 自身使用旧 Bash 可用语法，但它复用的 `multi_task_run.sh` 必须保持服务器上
   已验证的 Bash 版本兼容性；脚本不会替换该既有启动入口。
+
+## 6. S5 / S7 / S8 / S9 服务器反馈修复（2026-09-25）
+
+本次仅修改插件。根因与原始错误节选详见 [issue.md 第 11 节](../issue.md#11-s5s7s8s9-批量回归失败2026-09-25)。
+
+| 文件 | 修改内容与目的 |
+| --- | --- |
+| `rollout/replica.py` | 端口任务显式请求 0 CPU，避免 S5 第二次创建时被首 bundle 的 0.5 CPU 余量阻塞；保留 PG/bundle 约束。增加创建阶段、超时诊断与实际 CE 设备映射日志；校验 NPU 设备顺序。 |
+| `integration/verl/experimental_fully_async/llm_server_manager.py` | 合并 NPU claims 时先按真实设备数值排序，再分配 borrower rank；修正 snapshot 中设备索引；创建失败保留类型、原因链、阶段和 traceback。 |
+| `integration/verl/experimental_fully_async/rollouter.py` | 仅在测试入口将 S8/S9 映射为 basic placement，其他场景按原名处理。 |
+| `integration/verl/experimental_fully_async/task_runner.py` | S8/S9 按 spec 的 world_size/节点数校验 Worker/server 数量；保留串行/并发两次 create 和同 rank/server 断言，断言失败后注销已注册 CE。 |
+| `tests/unit/test_borrowed_runtime.py`、`test_borrowed_contract.py`、`test_d4_lifecycle.py` | 加入资源余量、设备合并顺序、错误诊断、场景映射及 TP=4 重试链路回归；无真实 Actor/NPU。 |
+
+S7 排序修复基于已复现的代码问题，不能仅凭 ACL 错误认定是上一场景残留。端口任务不
+使用加速器；CE Worker 继续按 claim 请求资源。测试 helper 的排序不会重排生产 GS spec，
+不会修改 donor PG，sleep/wake/reclaim/destroy 仍保持既有开发边界。
+
+本地验证命令：
+
+```bash
+python -m pytest -q -p no:cacheprovider \
+  tests/unit/test_borrowed_runtime.py tests/unit/test_borrowed_contract.py \
+  tests/unit/test_d4_lifecycle.py tests/unit/test_checkpoint_membership.py \
+  tests/unit/test_hccl_checkpoint_engine.py
+```
+
+使用仓库 `.venv` 解释器执行，结果 **60 passed**。真实 NPU 测试尚未在本机执行。
+
+服务器可使用 `D0_D4_BATCH_SCENARIOS=S5,S7,S8,S9 bash ../D0_D4_batch_test.sh` 依次复测。
+S5 应出现两份真实 placement、`PLACEMENT_READY` 和 cleanup；S7 应完成合并后的
+`RUNTIME_READY -> CE bootstrap -> LB_READY`；S8/S9 应出现各自幂等结果，默认 TP=4
+时 `worker_count=expected_worker_count=4`、`server_count=expected_server_count=1`。
+所有场景还需训练完成与清理证据；严格综合结果可能仍为 `INCOMPLETE`，见验收文档。

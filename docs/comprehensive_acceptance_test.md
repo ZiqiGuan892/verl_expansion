@@ -393,3 +393,30 @@ D0–D4 综合验收只有在以下条件全部满足时通过：
 9. 生产 sleep/wake/reclaim/destroy 另行验收，不得使用本文件的测试 teardown 冒充生命周期完成。
 
 在实现真实生成、结构化清理结果、LB 不确定提交核对和多任务 harness 之前，当前 D0–D4 只能标记为“阶段测试通过、综合验收未完成”。
+
+## 10. S5 / S7 / S8 / S9 复测说明（2026-09-25）
+
+| 场景 | 本次修复与需要查看的证据 |
+| --- | --- |
+| S5 | donor CE 占 1 CPU，borrower A/B 各占 0.5 CPU；两个 borrowed 的 accelerator fraction 各为 0.25。端口探测任务改为 0 CPU，避免只剩 0.5 CPU 时等待调度。依然在原 PG/bundle 上创建两套独立 runtime；检查 `D4_SHARED_BUNDLE_RESULT` 和清理结果。 |
+| S7 | 两个 donor 的 local_rank 会重复；先按节点内 Ray 设备 ID 数值排序，再分配 borrower rank/local_rank。检查 `BORROWED_WORKER_PLACEMENT` 中四个不同设备的升序映射、原 PG/bundle 归属，以及 CE 校验和 LB_READY。只排序 HTTP mask 而不调整 CE rank 不可作为修复。 |
+| S8 | fixture 使用 basic placement，同一份 spec/lease 仍串行提交两次。`D4_IDEMPOTENCY_RESULT` 中 rank/server 相同，Worker 数等于 spec.world_size，server 数等于节点数；默认是 4 Worker、1 server。 |
+| S9 | fixture 使用 basic placement，同一份 spec/lease 仍由两个线程并发提交；创建操作受原任务锁保护。`D4_CONCURRENCY_RESULT` 采用与 S8 相同的拓扑数量及端点一致性校验。 |
+
+失败回执现在包含 `error.type/stage/message/traceback`，有原因链时包含 `error.cause`。
+例如 `MASTER_ADDRESS` 阶段尚未创建 CE Actor；`HTTP_ENGINE_START` 阶段需继续查看
+EngineCore 日志。`kill_requested=[]` 本身不再被当作底层根因。
+
+S7 的原 ACL 错误不能证明 OOM 或残留进程；当前消除了代码中已确认的设备排序问题，
+仍需真实服务器验证。各场景独立使用测试 spec，不修改全局可见设备环境，不执行全局杀进程。
+
+```bash
+# 单独复测
+D0_D4_SCENARIOS=S7 bash ../D0_D4_comprehensive_test.sh
+# 四项严格串行复测，每项完成（无论成败）后才启动下一项
+D0_D4_BATCH_SCENARIOS=S5,S7,S8,S9 bash ../D0_D4_batch_test.sh
+```
+
+训练完成标记用于判断**训练步骤**是否完成。D4 smoke 在训练之后执行，若其创建/幂等检查
+失败，该 S 仍为 `FAIL`。阶段链路修复通过后，现有严格综合标准仍可能给出 `INCOMPLETE`，
+表示完整 borrowed 生成/同步/生命周期证据尚未覆盖，而不是这四项修复仍然抛出异常。
