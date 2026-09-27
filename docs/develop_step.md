@@ -319,3 +319,22 @@ export MT_GPU_TEST_CONFIG=/absolute/path/to/d0-gpu-test-config.json
 ```
 "multitask.runtime.profile=experimental_fully_async_standalone"
 ```
+
+### D4 综合验收启动链修复（批次 20260925111852）
+
+**范围：** 修复外层旧 D4 smoke 脚本与插件新版 E2E 校验器混用；给 S0 训练前 CE
+TCPStore 端口冲突增加诊断与最多一次完整启动重试。未修改原生 verl 或生产生命周期。
+
+批量/单场景脚本现在统一从 `VERL_MULTI_TASK_ROOT` 获取测试代码，保留服务器
+`MULTITASK_LAUNCH_SCRIPT` 的训练配置。`launch_check.py`、profile resolver 与 TaskRunner
+校验实际 E2E 配置/源码，防止跑错测试后才发现缺少回执。CE Worker 只补充端口异常的
+环境日志；`startup_diagnostics.py` 只读查询监听状态，不能认定占用者或清理未知进程。
+
+**验证：** 本地回归 **272 passed**，含新增 20 项配置/部署/真实 Bash 接线和有限重试
+测试；四个相关脚本逐个 `bash -n`、修改文件 `compileall`、`git diff --check` 通过。
+仍排除依赖指定原生 checkout 的 `test_entry.py` 16 项；没有运行真实 Ray/NPU 训练。
+
+**服务器操作与通过条件：** 按 [E2E 开发记录第 8 节](D0_D4_e2e_develop.md#8-批次-20260925111852-的启动链修复)
+及其前面的路径配置，从仓内 batch 先复测 S0/S1。S1 必须实际启用 E2E 并通过完整
+`D0_D4_E2E_RESULT` 校验；旧 smoke 训练完成仍不能替代。根因、修改清单、日志和重试
+限制见 `issue.md` 第 12 节。真实综合验收仍待服务器复测。

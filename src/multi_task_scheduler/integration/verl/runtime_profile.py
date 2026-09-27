@@ -90,6 +90,9 @@ def resolve_runtime_profile(config):
     Import failures propagate: an enabled MultiTask run must not silently fall
     back to native classes. This function never starts Ray or discovers GS.
     """
+    from multi_task_scheduler.testing.launch_check import verify_config
+
+    verify_config(config)
     if not validate_runtime_profile(config):
         return None
     from .experimental_fully_async.task_runner import MultiTaskFullyAsyncTaskRunner

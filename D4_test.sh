@@ -15,8 +15,9 @@ export VERL_REPO_DIR="${VERL_REPO_DIR:-${SCRIPT_DIR}}"
 export VERL_SOURCE_ROOT="${VERL_SOURCE_ROOT:-${VERL_REPO_DIR}/verl}"
 export VERL_MULTI_TASK_ROOT="${VERL_MULTI_TASK_ROOT:-${VERL_SOURCE_ROOT}/multi_task_verl}"
 
-[ -f "${SCRIPT_DIR}/multi_task_run.sh" ] || {
-    echo "未找到 multi_task_run.sh：${SCRIPT_DIR}/multi_task_run.sh" >&2
+export MULTITASK_LAUNCH_SCRIPT="${MULTITASK_LAUNCH_SCRIPT:-${VERL_REPO_DIR}/multi_task_run.sh}"
+[ -f "${MULTITASK_LAUNCH_SCRIPT}" ] || {
+    echo "未找到 multi_task_run.sh：${MULTITASK_LAUNCH_SCRIPT}" >&2
     exit 1
 }
 
@@ -28,15 +29,20 @@ case "${D4_E2E_TEST}" in
     *) echo "D4_E2E_TEST 必须为 0 或 1。" >&2; exit 1 ;;
 esac
 if [ "${D4_E2E_TEST}" = "1" ]; then
+    # An updated checkout must supply the fixture and verdict together. Do not
+    # fall back to a different directory when one part of deployment is stale.
     PYTHON_BIN="${PYTHON_BIN:-python3}"
     E2E_VERDICT="${VERL_MULTI_TASK_ROOT}/src/multi_task_scheduler/testing/e2e_verdict.py"
-    if [ ! -f "${E2E_VERDICT}" ] && [ -f "${SCRIPT_DIR}/src/multi_task_scheduler/testing/e2e_verdict.py" ]; then
-        E2E_VERDICT="${SCRIPT_DIR}/src/multi_task_scheduler/testing/e2e_verdict.py"
-    fi
     [ -f "${E2E_VERDICT}" ] && command -v "${PYTHON_BIN}" >/dev/null 2>&1 || {
         echo "E2E 缺少 Python 或回执校验器：${PYTHON_BIN} / ${E2E_VERDICT}" >&2
         exit 1
     }
+    export MULTITASK_E2E_REQUIRED=1
+    export MULTITASK_E2E_SOURCE_ROOT="${VERL_MULTI_TASK_ROOT}"
+    PYTHONPATH="${VERL_MULTI_TASK_ROOT}/src:${VERL_SOURCE_ROOT}" "${PYTHON_BIN}" \
+        "${VERL_MULTI_TASK_ROOT}/src/multi_task_scheduler/testing/launch_check.py" \
+        --source-root "${VERL_MULTI_TASK_ROOT}" --fixture-script "${BASH_SOURCE[0]}" \
+        --launcher "${MULTITASK_LAUNCH_SCRIPT}"
 fi
 mkdir -p "${D4_RUNTIME_LOG_DIR}"
 
@@ -107,6 +113,7 @@ for scenario in $(printf '%s' "${D4_RUNTIME_SCENARIOS}" | tr ',' ' '); do
 
     log_file="${D4_RUNTIME_LOG_DIR}/d4_${scenario}_$(date +%Y%m%d%H%M%S).log"
     if [ "${D4_E2E_TEST}" = "1" ]; then
+        export MULTITASK_E2E_SCENARIO="${scenario}"
         test_overrides=( "+multitask.d4_runtime_test.enabled=false" "+multitask.e2e_test.enabled=true" "+multitask.e2e_test.scenario=${scenario}" )
         echo "开始 D4 真实 E2E 场景：${scenario}"
     else
@@ -116,7 +123,7 @@ for scenario in $(printf '%s' "${D4_RUNTIME_SCENARIOS}" | tr ',' ' '); do
     echo "日志：${log_file}"
 
     set +e
-    env MULTITASK_PARAMETER_VALIDATION=1 MULTITASK_SOURCE_VALIDATION=1 bash "${SCRIPT_DIR}/multi_task_run.sh" \
+    env MULTITASK_PARAMETER_VALIDATION=1 MULTITASK_SOURCE_VALIDATION=1 bash "${MULTITASK_LAUNCH_SCRIPT}" \
         "actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}" \
         "actor_rollout_ref.rollout.n=${RESPONSES_PER_PROMPT}" \
         "async_training.require_batches=${ASYNC_REQUIRE_BATCHES}" \

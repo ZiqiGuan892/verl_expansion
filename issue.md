@@ -590,3 +590,84 @@ D0_D4_BATCH_SCENARIOS=S5,S7,S8,S9 bash ../D0_D4_batch_test.sh
 这些场景目前仍属阶段验证。修复后阶段链路成功时，严格综合脚本仍可能报告
 `INCOMPLETE`（缺少完整 borrowed generate/sync/生命周期证据），不能将其与本次
 `FAIL` 混为一谈，也不修改通过标准来掩盖错误。
+
+## 12. 批次 20260925111852：旧 smoke 与新 E2E 混用、S0 TCPStore 端口冲突
+
+以下日志节选来自用户提供的分析摘要，未直接读取服务器完整日志。代码审查确认了脚本
+来源混用的路径；具体服务器文件版本与 S0 端口占用者仍需新增运行证据确认。
+
+### 12.1 S1–S5、S7–S8 完成训练，但缺少 E2E 结果
+
+```text
+multitask.d4_runtime_test.enabled=true
+# 日志没有 multitask.e2e_test.enabled=true，也没有 D0_D4_E2E_RESULT
+MULTITASK_TRAINING_COMPLETE {"completed": true, "completed_steps": 1, "state": "COMPLETED"}
+E2E FAIL: expected exactly one E2E result marker
+```
+
+综合脚本原来调用 `${SCRIPT_DIR}/D4_test.sh`，而校验器取自
+`${VERL_MULTI_TASK_ROOT}/src/.../e2e_verdict.py`。服务器将脚本放在模型所在的外层目录，
+只更新插件 checkout 时，旧 D4 副本仍可能执行训练后 smoke，新版校验器则要求训练前
+创建 borrowed、真实生成和普通同步等完整 E2E 回执。训练完成不等于新版场景已执行；
+这种结果不能靠改判或补印 marker 变成 PASS，需要更新并重跑真实场景。
+
+修复：
+
+- `D0_D4_batch_test.sh`、`D0_D4_comprehensive_test.sh` 从同一个插件 checkout 获取所有
+  子脚本及校验器，修正仓内直接启动时的目录推导。
+- `D4_test.sh`、`D2_runtime_test.sh` 通过 `MULTITASK_LAUNCH_SCRIPT` 调用服务器已验证
+  的外层训练脚本，保留服务器配置；综合环境记录该路径。
+- 新增 `testing/launch_check.py`，检查实际 D4 副本、包导入路径、E2E hooks，并打印
+  `D0_D4_E2E_PREFLIGHT`。driver 的 `runtime_profile.py`、Actor 的 `task_runner.py`
+  在资源初始化前再次检查配置，启用 E2E 时打印 `D0_D4_E2E_START`。
+- `MULTITASK_E2E_REQUIRED=1` 下若 launcher 丢弃 E2E 参数，明确报
+  `D0_D4_E2E_CONFIG_MISMATCH`；不会运行旧 smoke 来冒充 E2E。最终回执校验不放宽，
+  `e2e_verdict.py` 在缺少 marker 时补充配置和部署排查提示。
+
+### 12.2 S0 初始化时端口已占用
+
+```text
+MultiTaskCheckpointEngineWorker ... init_process_group / TCPStore
+torch.distributed.DistNetworkError: The server socket has failed to listen on any
+local network address. port: 37227, code: -98, name: EADDRINUSE,
+message: address already in use
+```
+
+直接原因是 TCPStore 监听失败，训练尚未开始。摘要不能证明“上一场景残留进程占用”；
+S0 在批次中本身是第一项。原生 `get_master_addr_port()` 用临时 socket 探测空闲端口后
+立即关闭，Worker 随后才绑定，存在竞争窗口。固定/继承 `DIST_INIT_METHOD` 也可能使
+实际 rendezvous 不使用新选出的 `MASTER_PORT`，需核对环境后判断。
+
+修复保持在插件范围，不修改原生 verl、不独立替换某一个 rank 的端口：
+
+1. `checkpoint/checkpoint_engine_worker.py` 捕获端口占用异常时输出
+   `CE_RENDEZVOUS_CONFLICT`：PID、replica_rank、RANK/WORLD_SIZE、MASTER_ADDR/PORT、
+   DIST_INIT_METHOD、WG_PREFIX；随后原样抛出原异常。
+2. 新增 `testing/startup_diagnostics.py`，匹配训练前 CE 初始化冲突，使用 `ss` 只读
+   查询冲突端口；没有 `ss` 也会保存不可用说明。快照是失败后的状态，不反推当时占用者。
+3. 综合脚本 S0 默认最多重试一次完整主进程，让同一 WorkerGroup 重新执行原生端口
+   分配；每次日志独立保存，summary 标记 attempt。设置 `D0_D4_S0_PORT_RETRIES=0`
+   可关闭。OOM、训练期异常、缺少验收回执不重试；持续冲突仍报 FAIL，保留排查信息。
+
+这是瞬时端口竞争的有限恢复措施，不是未知残留进程的清理方案，不执行全局 kill。
+
+### 12.3 验证与重跑
+
+新增 `tests/unit/test_acceptance_launch.py` 的 20 项回归，包括真实 Bash 子进程的旧副本
+混用复现、E2E 参数传递、配置拒绝、端口诊断、仅重试初始化冲突/禁用重试/OOM 不重试。
+训练进程使用替身，未声称运行了真实 Ray/NPU。整合回归 **272 passed**，排除
+`test_entry.py` 的 16 项原生 checkout 一致性检查，原因见 E2E 开发记录第 6 节。
+
+完整更新服务器插件仓库后，从仓内入口先复测 S0/S1，避免继续执行外层旧副本：
+
+```bash
+export VERL_REPO_DIR=/workspace/n00873601/multi_rl_task_gzq_clone
+export VERL_SOURCE_ROOT="$VERL_REPO_DIR/verl"
+export VERL_MULTI_TASK_ROOT="$VERL_SOURCE_ROOT/multi_task_verl"
+export MULTITASK_LAUNCH_SCRIPT="$VERL_REPO_DIR/multi_task_run.sh"
+cd "$VERL_SOURCE_ROOT"
+D0_D4_BATCH_SCENARIOS=S0,S1 bash "$VERL_MULTI_TASK_ROOT/D0_D4_batch_test.sh"
+```
+
+S1 应有 PREFLIGHT、START 和最终 RESULT；缺少任一实际验收所需证据仍不能通过。
+S6 的多机环境阻塞保持原判定。服务器复测未在本地执行，本次不宣称该批次已经通过。

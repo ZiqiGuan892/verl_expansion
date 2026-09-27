@@ -26,8 +26,9 @@ export VERL_REPO_DIR="${VERL_REPO_DIR:-${SCRIPT_DIR}}"
 export VERL_SOURCE_ROOT="${VERL_SOURCE_ROOT:-${VERL_REPO_DIR}/verl}"
 export VERL_MULTI_TASK_ROOT="${VERL_MULTI_TASK_ROOT:-${VERL_SOURCE_ROOT}/multi_task_verl}"
 
-[ -f "${SCRIPT_DIR}/multi_task_run.sh" ] || {
-    echo "未找到 multi_task_run.sh：${SCRIPT_DIR}/multi_task_run.sh" >&2
+export MULTITASK_LAUNCH_SCRIPT="${MULTITASK_LAUNCH_SCRIPT:-${VERL_REPO_DIR}/multi_task_run.sh}"
+[ -f "${MULTITASK_LAUNCH_SCRIPT}" ] || {
+    echo "未找到 multi_task_run.sh：${MULTITASK_LAUNCH_SCRIPT}" >&2
     exit 1
 }
 
@@ -105,7 +106,7 @@ for scenario in $(printf '%s' "${D2_RUNTIME_SCENARIOS}" | tr ',' ' '); do
     echo "日志：${log_file}"
 
     set +e
-    bash "${SCRIPT_DIR}/multi_task_run.sh" \
+    bash "${MULTITASK_LAUNCH_SCRIPT}" \
         "actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}" \
         "actor_rollout_ref.rollout.n=${RESPONSES_PER_PROMPT}" \
         "async_training.require_batches=${ASYNC_REQUIRE_BATCHES}" \

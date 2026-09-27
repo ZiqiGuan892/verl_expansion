@@ -8,8 +8,8 @@
 #
 # 服务器上的典型用法：
 #   cd "$VERL_REPO_DIR/verl"
-#   D0_D4_SCENARIOS=S0 bash ../D0_D4_comprehensive_test.sh
-#   D0_D4_SCENARIOS=S1 bash ../D0_D4_comprehensive_test.sh
+#   D0_D4_SCENARIOS=S0 bash "$VERL_MULTI_TASK_ROOT/D0_D4_comprehensive_test.sh"
+#   D0_D4_SCENARIOS=S1 bash "$VERL_MULTI_TASK_ROOT/D0_D4_comprehensive_test.sh"
 #
 # 旧 Bash 兼容：不依赖 pipefail；每个子进程使用 tee 实时打印并记录
 # 日志，通过 PIPESTATUS 显式检查退出码。完整验收返回 0；执行失败返回 1；代码或环境尚未支持
@@ -23,12 +23,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 以及本地开发布局：脚本就在插件仓库根目录。
 if [ -d "${SCRIPT_DIR}/src/multi_task_scheduler" ]; then
     DEFAULT_MULTI_TASK_ROOT="${SCRIPT_DIR}"
-    DEFAULT_REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-    DEFAULT_SOURCE_ROOT="${DEFAULT_REPO_DIR}/verl"
+    DEFAULT_SOURCE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+    DEFAULT_REPO_DIR="$(cd "${DEFAULT_SOURCE_ROOT}/.." && pwd)"
 else
     DEFAULT_REPO_DIR="${SCRIPT_DIR}"
-    DEFAULT_SOURCE_ROOT="${SCRIPT_DIR}/verl"
-    DEFAULT_MULTI_TASK_ROOT="${SCRIPT_DIR}/verl/multi_task_verl"
+    DEFAULT_SOURCE_ROOT="${VERL_REPO_DIR:-${DEFAULT_REPO_DIR}}/verl"
+    DEFAULT_MULTI_TASK_ROOT="${VERL_SOURCE_ROOT:-${DEFAULT_SOURCE_ROOT}}/multi_task_verl"
 fi
 
 export VERL_REPO_DIR="${VERL_REPO_DIR:-${DEFAULT_REPO_DIR}}"
@@ -43,8 +43,9 @@ export VERL_MULTI_TASK_ROOT="${VERL_MULTI_TASK_ROOT:-${DEFAULT_MULTI_TASK_ROOT}}
     echo "原生 verl 源码根不存在：${VERL_SOURCE_ROOT}" >&2
     exit 2
 }
-[ -f "${SCRIPT_DIR}/multi_task_run.sh" ] || {
-    echo "未找到 multi_task_run.sh：${SCRIPT_DIR}/multi_task_run.sh" >&2
+export MULTITASK_LAUNCH_SCRIPT="${MULTITASK_LAUNCH_SCRIPT:-${VERL_REPO_DIR}/multi_task_run.sh}"
+[ -f "${MULTITASK_LAUNCH_SCRIPT}" ] || {
+    echo "未找到服务器训练启动脚本：${MULTITASK_LAUNCH_SCRIPT}" >&2
     exit 2
 }
 
@@ -147,6 +148,7 @@ print(json.dumps({
     "verl_repo_dir": os.environ.get("VERL_REPO_DIR"),
     "verl_source_root": os.environ.get("VERL_SOURCE_ROOT"),
     "multi_task_root": os.environ.get("VERL_MULTI_TASK_ROOT"),
+    "training_launcher": os.environ.get("MULTITASK_LAUNCH_SCRIPT"),
     "model_path": os.environ.get("MODEL_PATH", os.environ.get("ACTOR_MODEL_PATH")),
     "train_file": os.environ.get("TRAIN_FILE"),
     "test_file": os.environ.get("TEST_FILE"),
@@ -156,9 +158,16 @@ PY
 }
 
 run_native_baseline() {
-    log_file="${RUN_DIR}/S0_native_baseline.log"
-    echo "[D0-D4] 开始 S0 native baseline"
-    if run_logged "${log_file}" env MULTITASK_PARAMETER_VALIDATION=1 bash "${SCRIPT_DIR}/multi_task_run.sh" \
+    retries="${D0_D4_S0_PORT_RETRIES:-1}"
+    case "${retries}" in
+        0|1) ;;
+        *) record_result S0 FAIL "" "D0_D4_S0_PORT_RETRIES 只能为 0 或 1"; return ;;
+    esac
+    attempt=0
+    while :; do
+    log_file="${RUN_DIR}/S0_native_baseline_attempt_${attempt}.log"
+    echo "[D0-D4] 开始 S0 native baseline；attempt=${attempt}"
+    if run_logged "${log_file}" env MULTITASK_PARAMETER_VALIDATION=1 bash "${MULTITASK_LAUNCH_SCRIPT}" \
         "actor_rollout_ref.actor.ppo_mini_batch_size=2" \
         "actor_rollout_ref.rollout.n=2" \
         "async_training.require_batches=1" \
@@ -170,13 +179,29 @@ run_native_baseline() {
         "+actor_rollout_ref.rollout.enable_sleep_mode=true" \
         "actor_rollout_ref.rollout.free_cache_engine=true"; then
         if has_training_complete_marker "${log_file}" && has_parameter_validation_marker "${log_file}"; then
-            record_result S0 PASS "${log_file}" "native 训练完成且 CE Worker 逐参数校验通过"
+            record_result S0 PASS "${log_file}" "native 训练完成且 CE Worker 逐参数校验通过；attempt=${attempt}"
         else
             record_result S0 FAIL "${log_file}" "缺少严格的全 step 完成标记或 CE Worker 逐参数校验证据"
         fi
+        return
     else
-        record_result S0 FAIL "${log_file}" "native main_ppo 退出失败"
+        diagnostic_file="${RUN_DIR}/S0_port_diagnostic_attempt_${attempt}.log"
+        if "${PYTHON_BIN}" "${VERL_MULTI_TASK_ROOT}/src/multi_task_scheduler/testing/startup_diagnostics.py" \
+            "${log_file}" > "${diagnostic_file}" 2>&1; then
+            cat "${diagnostic_file}"
+            if [ "${attempt}" -lt "${retries}" ]; then
+                echo "[D0-D4] S0 初始化端口冲突；保留失败日志，使用新主进程重试一次，重新执行原生通信端口选择。"
+                attempt=$((attempt + 1))
+                sleep 2
+                continue
+            fi
+        else
+            cat "${diagnostic_file}"
+        fi
+        record_result S0 FAIL "${log_file}" "native main_ppo 退出失败；attempt=${attempt}；诊断=${diagnostic_file}"
+        return
     fi
+    done
 }
 
 run_d4_scenario() {
@@ -186,6 +211,10 @@ run_d4_scenario() {
     child_log_dir="${RUN_DIR}/${scenario}_d4_logs"
     mkdir -p "${child_log_dir}"
     echo "[D0-D4] 开始 ${scenario} -> D4 ${d4_scenario}"
+    # The source checkout is authoritative for the fixture AND its validator.
+    # Scripts copied beside the model directory may still be an older smoke.
+    echo "[D0-D4] fixture: ${VERL_MULTI_TASK_ROOT}/D4_test.sh"
+    echo "[D0-D4] training launcher: ${MULTITASK_LAUNCH_SCRIPT}"
     if run_logged "${log_file}" env \
         VERL_REPO_DIR="${VERL_REPO_DIR}" \
         VERL_SOURCE_ROOT="${VERL_SOURCE_ROOT}" \
@@ -194,7 +223,7 @@ run_d4_scenario() {
         D4_E2E_TEST=1 \
         D4_RUNTIME_SCENARIOS="${d4_scenario}" \
         D4_RUNTIME_LOG_DIR="${child_log_dir}" \
-        bash "${SCRIPT_DIR}/D4_test.sh"; then
+        bash "${VERL_MULTI_TASK_ROOT}/D4_test.sh"; then
         if "${PYTHON_BIN}" "${VERL_MULTI_TASK_ROOT}/src/multi_task_scheduler/testing/e2e_verdict.py" \
             "${log_file}" "${d4_scenario}" --process-exit-code 0; then
             record_result "${scenario}" PASS "${log_file}" "真实 E2E 回执通过：拓扑、逐 replica 生成、训练期普通同步、版本推进和测试清理"
@@ -219,7 +248,7 @@ run_d2_negative() {
         VERL_MULTI_TASK_ROOT="${VERL_MULTI_TASK_ROOT}" \
         D2_RUNTIME_SCENARIOS="${d2_scenarios}" \
         D2_RUNTIME_LOG_DIR="${child_log_dir}" \
-        bash "${SCRIPT_DIR}/D2_runtime_test.sh"; then
+        bash "${VERL_MULTI_TASK_ROOT}/D2_runtime_test.sh"; then
         if grep -Fq 'D2_RUNTIME_RESULT' "${log_file}" && \
             grep -Fq '"status": "EXPECTED_FAILURE"' "${log_file}" && \
             has_training_complete_marker "${log_file}"; then

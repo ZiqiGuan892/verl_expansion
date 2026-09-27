@@ -46,6 +46,11 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
 
     def run(self, config):
         """Attach this Actor to GS, then execute verl's original run method."""
+        from multi_task_scheduler.testing.launch_check import verify_config
+
+        launch = verify_config(config)
+        if launch is not None:
+            print("D0_D4_E2E_START " + json.dumps(launch, sort_keys=True), flush=True)
         self.group_scheduler = get_or_create_group_scheduler()
         context = ray.get_runtime_context()
         task_id = context.get_actor_id()

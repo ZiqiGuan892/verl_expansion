@@ -8,11 +8,25 @@
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SINGLE_TEST="${SCRIPT_DIR}/D0_D4_comprehensive_test.sh"
+if [ -d "${SCRIPT_DIR}/src/multi_task_scheduler" ]; then
+    DEFAULT_PLUGIN_ROOT="${SCRIPT_DIR}"
+    DEFAULT_SOURCE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+    DEFAULT_REPO_DIR="$(cd "${DEFAULT_SOURCE_ROOT}/.." && pwd)"
+else
+    DEFAULT_REPO_DIR="${SCRIPT_DIR}"
+    DEFAULT_SOURCE_ROOT="${VERL_REPO_DIR:-${DEFAULT_REPO_DIR}}/verl"
+    DEFAULT_PLUGIN_ROOT="${VERL_SOURCE_ROOT:-${DEFAULT_SOURCE_ROOT}}/multi_task_verl"
+fi
+export VERL_REPO_DIR="${VERL_REPO_DIR:-${DEFAULT_REPO_DIR}}"
+export VERL_SOURCE_ROOT="${VERL_SOURCE_ROOT:-${DEFAULT_SOURCE_ROOT}}"
+export VERL_MULTI_TASK_ROOT="${VERL_MULTI_TASK_ROOT:-${DEFAULT_PLUGIN_ROOT}}"
+SINGLE_TEST="${VERL_MULTI_TASK_ROOT}/D0_D4_comprehensive_test.sh"
 [ -f "${SINGLE_TEST}" ] || {
     echo "未找到单场景脚本：${SINGLE_TEST}" >&2
     exit 2
 }
+echo "[D0-D4-BATCH] source checkout: ${VERL_MULTI_TASK_ROOT}"
+echo "[D0-D4-BATCH] single test: ${SINGLE_TEST}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 export PYTHON_BIN
 command -v "${PYTHON_BIN}" >/dev/null 2>&1 || {

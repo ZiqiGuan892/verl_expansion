@@ -254,7 +254,12 @@ def _unique_json_object(pairs):
 def validate_log(log_text, expected_scenario, process_exit_code):
     """Require process success and exactly one complete, parseable final receipt."""
     _require(type(process_exit_code) is int and process_exit_code == 0, "main_ppo process exit status was not zero")
-    _require(log_text.count(RESULT_MARKER) == 1, "expected exactly one E2E result marker")
+    count = log_text.count(RESULT_MARKER)
+    hint = ""
+    if count == 0:
+        hint = ("; no complete E2E receipt was produced. Check D0_D4_E2E_PREFLIGHT / D0_D4_E2E_START "
+                "and multitask.e2e_test.enabled=true. Legacy D4 smoke/training completion is not E2E evidence.")
+    _require(count == 1, f"expected exactly one E2E result marker (found {count}){hint}")
     line = next(line for line in log_text.splitlines() if RESULT_MARKER in line)
     payload = line.split(RESULT_MARKER, 1)[1]
     try:

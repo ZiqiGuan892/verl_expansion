@@ -134,24 +134,31 @@ donor 恢复失败。现有 `test_wiring.py` 的父类替身补齐 config/manage
 的一致性，本轮没有准备并验证该 checkout。已有测试依赖 `omegaconf` 通过 uv 安装。
 上述通过结果属于本地单元/替身层，不包含真实 Ray/NPU 训练，也不是 native entry 验收。
 
-目标服务器沿用现有模型、数据、Python、profile 和源码布局，从已能运行
-`multi_task_run.sh` 的目录执行：
+目标服务器沿用现有模型、数据、Python、profile 和源码布局。**测试脚本必须直接使用
+插件 checkout 中的版本**，避免外层目录留存旧脚本。先完整更新插件仓库，再指定路径；
+外层已经跑通的 `multi_task_run.sh` 保留其服务器配置：
 
 ```bash
+export VERL_REPO_DIR=/workspace/n00873601/multi_rl_task_gzq_clone
+export VERL_SOURCE_ROOT="$VERL_REPO_DIR/verl"
+export VERL_MULTI_TASK_ROOT="$VERL_SOURCE_ROOT/multi_task_verl"
+export MULTITASK_LAUNCH_SCRIPT="$VERL_REPO_DIR/multi_task_run.sh"
+cd "$VERL_SOURCE_ROOT"
+
 # 每次一个独立场景，自动开启 E2E
-D0_D4_SCENARIOS=S1 bash ../D0_D4_comprehensive_test.sh
-D0_D4_SCENARIOS=S5 bash ../D0_D4_comprehensive_test.sh
-D0_D4_SCENARIOS=S16 bash ../D0_D4_comprehensive_test.sh
+D0_D4_SCENARIOS=S1 bash "$VERL_MULTI_TASK_ROOT/D0_D4_comprehensive_test.sh"
+D0_D4_SCENARIOS=S5 bash "$VERL_MULTI_TASK_ROOT/D0_D4_comprehensive_test.sh"
+D0_D4_SCENARIOS=S16 bash "$VERL_MULTI_TASK_ROOT/D0_D4_comprehensive_test.sh"
 
 # 同机正例子集，逐项串行；保留每项日志和汇总
 D0_D4_BATCH_SCENARIOS=S1,S2,S3,S4,S5,S7,S8,S9,S16 \
-  bash ../D0_D4_batch_test.sh
+  bash "$VERL_MULTI_TASK_ROOT/D0_D4_batch_test.sh"
 
 # 直接复用 D4 的同一 E2E 模式
-D4_E2E_TEST=1 D4_RUNTIME_SCENARIOS=split bash ../D4_test.sh
+D4_E2E_TEST=1 D4_RUNTIME_SCENARIOS=split bash "$VERL_MULTI_TASK_ROOT/D4_test.sh"
 
 # 默认仍为旧 smoke
-D4_RUNTIME_SCENARIOS=basic bash ../D4_test.sh
+D4_RUNTIME_SCENARIOS=basic bash "$VERL_MULTI_TASK_ROOT/D4_test.sh"
 ```
 
 服务器脚本输出的 `environment.json`、场景日志和 `summary.json` 是本次实际运行证据。
@@ -172,3 +179,50 @@ donor 最新参数同步和恢复后的真实生成进一步验证资源可重�
 
 这里的恢复和 teardown 是 opt-in 验收设施，不能据此宣布生产 sleep/wake、drain、
 reclaim、destroy、跨 Task 生命周期或公平性策略已实现。
+
+## 8. 批次 20260925111852 的启动链修复
+
+用户提供的日志摘要显示：S1–S5、S7–S8 完成的是旧 D4 smoke，未启用
+`multitask.e2e_test`；新校验器找不到最终 E2E 回执。代码中确认综合脚本原先从自身
+目录选 `D4_test.sh`，却从插件目录选 `e2e_verdict.py`，允许外层旧副本和新插件混用。
+缺少 E2E 证据的旧结果仍不可作为新综合验收通过依据，必须重新执行。
+
+| 修改文件 | 修改及目的 |
+| --- | --- |
+| `D0_D4_batch_test.sh` | 单场景脚本固定取自 `VERL_MULTI_TASK_ROOT`，支持直接从插件 checkout 启动 |
+| `D0_D4_comprehensive_test.sh` | D4/D2 子脚本与校验器使用同一 checkout；独立指定服务器训练 launcher；记录实际路径 |
+| `D4_test.sh`、`D2_runtime_test.sh` | 使用 `MULTITASK_LAUNCH_SCRIPT` 复用已跑通的服务器模型/数据配置；D4 的 E2E 模式增加启动前检查 |
+| `testing/launch_check.py` | 检查脚本副本、插件导入路径、E2E hook；输出路径和源码摘要；拒绝 E2E 参数丢失或旧 smoke 同时开启 |
+| `integration/verl/runtime_profile.py`、`experimental_fully_async/task_runner.py` | 分别在 driver 初始化 Ray 前、TaskRunner 初始化组件前核对配置；有效 E2E 输出 `D0_D4_E2E_START` |
+| `testing/e2e_verdict.py` | 缺少回执时提示检查配置/部署；通过条件不变 |
+| `checkpoint/checkpoint_engine_worker.py` | 仅在端口占用异常时打印实际 rendezvous 环境，随后原样抛出异常 |
+| `testing/startup_diagnostics.py`、综合脚本 S0 | 识别训练前的 CE TCPStore 端口冲突，记录只读端口诊断；最多重试一次完整启动 |
+| `tests/unit/test_acceptance_launch.py` | 回归验证上述配置、路径、诊断和有限重试；Bash 测试使用替身训练进程 |
+
+正常 E2E 的控制台依次可见 `D0_D4_E2E_PREFLIGHT`、`D0_D4_E2E_START`，完成后才有
+`D0_D4_E2E_RESULT`。启动检查不是验收通过回执。launcher 仍须将收到的 `"$@"`
+传给原生入口，并使用指定的插件源码；否则新版 driver 会在初始化前明确报配置错误。
+更新插件仓库不会自动更新外层已经复制过的脚本，故上面的命令直接指向仓内入口。
+
+S0 的 `EADDRINUSE` 只证明端口绑定失败，无法从摘要确认占用者。原生端口探测释放
+socket 后才由 Worker 创建 TCPStore，存在竞争窗口；继承的 `DIST_INIT_METHOD`
+也可能改变 rendezvous 地址，需结合新增日志核对。修复不单独更改 rank 0 的端口，
+避免同组其他 Worker 仍连接旧端口。只有进程失败且符合“训练前 CE 初始化端口冲突”
+时，才启动一次全新的主进程；OOM、训练期错误、缺少回执均不触发该重试。
+
+默认 `D0_D4_S0_PORT_RETRIES=1`，设为 `0` 可禁用。每次启动保存独立
+`S0_native_baseline_attempt_0.log` / `attempt_1.log`，冲突诊断另存
+`S0_port_diagnostic_attempt_*.log`；summary 的 `attempt` 记录使用了哪次结果。
+`ss` 查询只观察失败之后的监听状态，不能反推当时占用者；不会杀死未知进程。
+重试不是对持久占用/残留进程的清理方案，再次失败仍为 FAIL 并保留全部证据。
+
+本次已执行本地回归：
+
+```powershell
+$env:PYTHONPATH=(Join-Path (Get-Location) 'src')
+.venv\Scripts\python.exe -m pytest tests/unit --ignore=tests/unit/test_entry.py -q --basetemp=.pytest_cache/all_tmp
+```
+
+结果 **272 passed**（包含新增 20 项）。其中 shell 用例用真实 Git Bash 调用测试脚本，
+但训练 launcher、回执和部分检查使用显式替身；不代表 NPU 实测。`test_entry.py` 的
+16 项原生 checkout 一致性检查仍按第 6 节说明排除。本次未连接服务器执行训练。

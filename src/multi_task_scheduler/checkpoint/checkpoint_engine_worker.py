@@ -1,6 +1,7 @@
 """Native receiver extension with an opt-in per-parameter audit manifest."""
 
 import hashlib
+import json
 import os
 
 import torch
@@ -14,7 +15,17 @@ class MultiTaskCheckpointEngineWorker(CheckpointEngineWorker):
     """Record receiver-side parameter fingerprints while reusing native transport."""
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        try:
+            super().__init__(*args, **kwargs)
+        except Exception as error:
+            if "EADDRINUSE" in str(error) or "address already in use" in str(error).lower():
+                # Observe the rendezvous actually selected by Ray/native verl.
+                # Changing just rank 0's port would strand every other rank.
+                diagnostic = {key: os.environ.get(key) for key in
+                              ("RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT", "DIST_INIT_METHOD", "WG_PREFIX")}
+                diagnostic.update(pid=os.getpid(), replica_rank=kwargs.get("replica_rank"), error=str(error))
+                print("CE_RENDEZVOUS_CONFLICT " + json.dumps(diagnostic, sort_keys=True), flush=True)
+            raise
         self.parameter_validation_enabled = (
             os.environ.get("MULTITASK_PARAMETER_VALIDATION", "0") == "1"
             or os.environ.get("MULTITASK_SOURCE_VALIDATION", "0") == "1"
